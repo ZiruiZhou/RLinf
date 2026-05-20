@@ -582,6 +582,7 @@ class LiberoEnv(gym.Env):
             "wrist_images": wrist_image_tensor,
             "states": states,
             "task_descriptions": self.task_descriptions,
+            "_elapsed_steps": torch.as_tensor(self._elapsed_steps.copy()),
         }
         return obs
 
@@ -642,8 +643,11 @@ class LiberoEnv(gym.Env):
         for i, idx in enumerate(env_idx):
             self.current_raw_obs[idx] = raw_obs[i]
 
-        obs = self._wrap_obs(self.current_raw_obs)
+        # Reset metrics BEFORE wrapping the obs so the obs reflects the post-reset
+        # state (e.g. _elapsed_steps=0). Downstream consumers (the lingbotva_wan
+        # wrapper) detect intra-task episode resets via _elapsed_steps decreasing.
         self._reset_metrics(env_idx)
+        obs = self._wrap_obs(self.current_raw_obs)
         infos = {}
         return obs, infos
 

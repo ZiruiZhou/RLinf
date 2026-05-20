@@ -115,6 +115,12 @@ class EnvOutput:
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
+            # Optional metadata used by the lingbotva_wan wrapper (intra-task
+            # episode reset detection + per-frame video keyframes for KV cache).
+            # Other models ignore unknown keys.
+            "_elapsed_steps": obs.get("_elapsed_steps", None),
+            "_chunk_main_keyframes": obs.get("_chunk_main_keyframes", None),
+            "_chunk_wrist_keyframes": obs.get("_chunk_wrist_keyframes", None),
         }
 
     @staticmethod

@@ -486,6 +486,20 @@ class EnvWorker(Worker):
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
+            # Attach the full per-step video sequence so models that need video-
+            # level context (e.g. lingbotva_wan's VA_Server.compute_kv_cache,
+            # which mirrors lingbot-va/evaluation/libero/client.py's `key_frame_list`
+            # of 16 obs per chunk for libero) can consume them. Stored as tensors
+            # so split_dict handles them like other obs. Other models ignore
+            # unknown keys.
+            if extracted_obs is not None and obs_list:
+                main_kf = [o.get("main_images") for o in obs_list]
+                wrist_kf = [o.get("wrist_images") for o in obs_list]
+                if all(t is not None for t in main_kf):
+                    # stack along time dim -> [num_envs, T, H, W, C] (T = chunk_size)
+                    extracted_obs["_chunk_main_keyframes"] = torch.stack(main_kf, dim=1)
+                if all(t is not None for t in wrist_kf):
+                    extracted_obs["_chunk_wrist_keyframes"] = torch.stack(wrist_kf, dim=1)
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
