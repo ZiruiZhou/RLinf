@@ -67,6 +67,17 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_dreamzero_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
+        elif SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.LINGBOTVA
+        ]:
+            self._lingbotva_loss = None
+            from rlinf.data.datasets.lingbotva import (
+                build_lingbotva_sft_dataloader,
+            )
+
+            return build_lingbotva_sft_dataloader(
+                self.cfg, self._world_size, self._rank, data_paths, eval_dataset
+            )
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
@@ -80,12 +91,18 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.LINGBOTVLA,
             SupportedModel.DREAMZERO,
+            SupportedModel.LINGBOTVA,
         ]:
             with self.amp_context:
                 losses_dict = self.model(forward_type=ForwardType.SFT, data=batch)
             if losses_dict.get("dynamics_loss", None) is not None:
                 self._dreamzero_loss = {
                     "dynamics_loss": losses_dict["dynamics_loss"],
+                    "action_loss": losses_dict["action_loss"],
+                }
+            if losses_dict.get("latent_loss", None) is not None:
+                self._lingbotva_loss = {
+                    "latent_loss": losses_dict["latent_loss"],
                     "action_loss": losses_dict["action_loss"],
                 }
             return losses_dict["loss"]
@@ -126,6 +143,18 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 }
             )
             self._dreamzero_loss = None
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            in [SupportedModel.LINGBOTVA]
+            and getattr(self, "_lingbotva_loss", None) is not None
+        ):
+            train_metrics.update(
+                {
+                    "latent_loss": self._lingbotva_loss["latent_loss"],
+                    "action_loss": self._lingbotva_loss["action_loss"],
+                }
+            )
+            self._lingbotva_loss = None
         return train_metrics
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:

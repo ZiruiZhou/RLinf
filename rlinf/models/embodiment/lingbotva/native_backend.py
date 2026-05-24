@@ -19,42 +19,20 @@ from __future__ import annotations
 import atexit
 import copy
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_file
 
+from rlinf.models.embodiment.lingbotva._utils import (
+    extend_import_path,
+    load_transformer_state_dict,
+)
 from rlinf.utils.logging import get_logger
 
 logger = get_logger()
-
-
-_TRANSFORMER_STATE_PREFIXES = (
-    "_sft_core.transformer.",
-    "transformer.",
-)
-
-
-def _extend_import_path(repo_path: Path) -> None:
-    repo_str = str(repo_path)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
-
-
-def _extract_transformer_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
-    for prefix in _TRANSFORMER_STATE_PREFIXES:
-        extracted = {
-            key[len(prefix):]: value
-            for key, value in state_dict.items()
-            if key.startswith(prefix)
-        }
-        if extracted:
-            return extracted
-    return state_dict
 
 
 def _resolve_cuda_local_rank() -> int:
@@ -127,7 +105,7 @@ class LingbotVALiberoBackend:
             )
 
     def _build_server(self):
-        _extend_import_path(self.repo_path)
+        extend_import_path(self.repo_path)
 
         from wan_va.configs import VA_CONFIGS
         from wan_va.utils import data_seq_to_patch, get_mesh_id
@@ -163,7 +141,9 @@ class LingbotVALiberoBackend:
         self._data_seq_to_patch = data_seq_to_patch
         self._get_mesh_id = get_mesh_id
         if self.transformer_state_dict_path is not None:
-            self._load_transformer_state_dict(server.transformer)
+            load_transformer_state_dict(
+                server.transformer, self.transformer_state_dict_path
+            )
         logger.info(
             "Initialized in-process LingBot-VA Libero runtime on device %s "
             "(CUDA_VISIBLE_DEVICES=%s).",
@@ -171,64 +151,6 @@ class LingbotVALiberoBackend:
             os.environ.get("CUDA_VISIBLE_DEVICES"),
         )
         return server
-
-    def _load_transformer_state_dict(self, transformer: torch.nn.Module) -> None:
-        if self.transformer_state_dict_path is None:
-            return
-        if not self.transformer_state_dict_path.exists():
-            raise FileNotFoundError(
-                "LingBot-VA transformer state dict path does not exist: "
-                f"{self.transformer_state_dict_path}"
-            )
-
-        checkpoint_path = self.transformer_state_dict_path
-        if checkpoint_path.is_dir():
-            transformer_dir = (
-                checkpoint_path / "transformer"
-                if (checkpoint_path / "transformer" / "config.json").exists()
-                else checkpoint_path
-            )
-            state_path = transformer_dir / "diffusion_pytorch_model.safetensors"
-            if not state_path.exists():
-                raise FileNotFoundError(
-                    "LingBot-VA transformer checkpoint directory must contain "
-                    f"diffusion_pytorch_model.safetensors: {transformer_dir}"
-                )
-            transformer_state = load_file(str(state_path), device="cpu")
-        else:
-            raw_state = torch.load(
-                checkpoint_path,
-                map_location="cpu",
-                weights_only=False,
-            )
-            if not isinstance(raw_state, dict):
-                raise TypeError(
-                    "LingBot-VA transformer state dict must deserialize to a dict, got "
-                    f"{type(raw_state)!r}."
-                )
-            transformer_state = _extract_transformer_state_dict(raw_state)
-        missing_keys, unexpected_keys = transformer.load_state_dict(
-            transformer_state, strict=False
-        )
-        if missing_keys or unexpected_keys:
-            preview_missing = ", ".join(missing_keys[:5])
-            preview_unexpected = ", ".join(unexpected_keys[:5])
-            logger.warning(
-                "LingBot-VA transformer checkpoint partial match "
-                "(missing=%d, unexpected=%d). Missing preview: [%s]. "
-                "Unexpected preview: [%s].",
-                len(missing_keys),
-                len(unexpected_keys),
-                preview_missing,
-                preview_unexpected,
-            )
-        logger.info(
-            "Loaded LingBot-VA Libero transformer checkpoint from %s "
-            "(missing=%d, unexpected=%d).",
-            self.transformer_state_dict_path,
-            len(missing_keys),
-            len(unexpected_keys),
-        )
 
     def _cfg_batch_size(self, batch_size: int) -> int:
         return batch_size * (2 if self._server.use_cfg else 1)

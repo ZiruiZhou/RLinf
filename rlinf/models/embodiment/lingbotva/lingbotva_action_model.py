@@ -12,17 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LingBot-VA action model adapter for RLinf Libero evaluation."""
+"""LingBot-VA action model adapter for RLinf Libero eval and SFT training."""
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.lingbotva._utils import (
+    extend_import_path,
+    load_transformer_state_dict,
+)
 from rlinf.models.embodiment.lingbotva.history_buffer import LingbotVAEpisodeState
 from rlinf.models.embodiment.lingbotva.native_backend import LingbotVALiberoBackend
 from rlinf.models.embodiment.lingbotva.observation_adapter import (
@@ -31,18 +38,32 @@ from rlinf.models.embodiment.lingbotva.observation_adapter import (
 
 
 class LingbotVAActionModel(nn.Module, BasePolicy):
-    """LingBot-VA inference-only adapter for the Libero suite.
+    """LingBot-VA adapter for the Libero suite.
 
-    Each :meth:`predict_action_batch` call runs one diffusion-based inference.
-    For the very first chunk of an episode we follow LingBot-VA's first-chunk
-    semantics (``start_idx=1``: skip the conditioning frame, producing
-    ``(frame_chunk_size - 1) * action_per_frame`` env actions). On subsequent
-    chunks we either:
-      * Replay the previously cached key-frame history via the model's KV
-        cache (the official LingBot-VA flow), or
-      * Reuse the cached ``first_obs`` and start fresh from ``frame_st_id=0``
-        when no chunk observations have been recorded yet.
+    Two operating modes:
+
+    * **Eval (default)** — :meth:`predict_action_batch` runs one diffusion-based
+      inference per call, wrapping ``wan_va.wan_va_server.VA_Server`` in-process
+      via :class:`LingbotVALiberoBackend`. The transformer lives inside the
+      backend and is invisible to FSDP.
+
+    * **Training** (``cfg.lingbotva.training_mode=True``) —
+      :meth:`sft_forward` runs one flow-matching diffusion step on the
+      pre-extracted latent + action targets from the dataloader. The
+      transformer is exposed as a direct ``nn.Module`` child so that FSDP can
+      wrap it and the SFT worker can drive the optimizer. VAE and text encoder
+      are not loaded (the dataset provides cached latents and the empty UMT5
+      embedding).
     """
+
+    # FSDP wrap policy reads `_no_split_modules` from the top-level model.
+    # `WanTransformer3DModel` already declares `["WanTransformerBlock"]`
+    # internally; we re-declare here for the outer wrapper.
+    _no_split_modules = [
+        "WanTransformerBlock",
+        "WanAttention",
+        "WanTransformer3DModel",
+    ]
 
     def __init__(self, cfg: Any, torch_dtype: torch.dtype = torch.bfloat16):
         super().__init__()
@@ -64,11 +85,24 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         self.enable_kv_cache_replay = bool(
             getattr(cfg.lingbotva, "enable_kv_cache_replay", False)
         )
+        self.training_mode = bool(
+            getattr(cfg.lingbotva, "training_mode", False)
+        )
 
         self._backend: LingbotVALiberoBackend | None = None
         self._episode_states: dict[int, LingbotVAEpisodeState] = {}
+        self._ac_applied = False
+
+        if self.training_mode:
+            self._load_transformer_for_training()
+
+    # ------------------------------------------------------------------
+    # Forward dispatch
+    # ------------------------------------------------------------------
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
+        if forward_type == ForwardType.SFT:
+            return self.sft_forward(**kwargs)
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
         raise NotImplementedError(
@@ -78,11 +112,267 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
     def default_forward(self, **kwargs):
         del kwargs
         raise NotImplementedError(
-            "LingBot-VA default_forward is not supported in the eval integration. "
-            "Use predict_action_batch."
+            "LingBot-VA default_forward is not supported. Use predict_action_batch "
+            "for eval or sft_forward for training."
         )
 
+    # ------------------------------------------------------------------
+    # Training path
+    # ------------------------------------------------------------------
+
+    def _load_transformer_for_training(self) -> None:
+        """Load only the transformer + flow-matching schedulers (no VAE / TE)."""
+        repo_path = Path(self.config.lingbotva.repo_path)
+        extend_import_path(repo_path)
+        from wan_va.modules.utils import load_transformer
+
+        transformer_path = os.path.join(self.config.model_path, "transformer")
+        # Match `wan_va/train.py:84-89` — load fp32 on CPU; mixed precision in
+        # FSDP and the bf16 cast in the worker handle dtype conversion.
+        self.transformer = load_transformer(
+            transformer_path,
+            torch_dtype=torch.float32,
+            torch_device="cpu",
+            attn_mode="flex",
+        )
+
+        # Optional SFT-checkpoint override (rare for first-stage SFT; useful
+        # when resuming or fine-tuning further).
+        override_path = getattr(
+            self.config.lingbotva, "transformer_state_dict_path", None
+        )
+        if override_path:
+            load_transformer_state_dict(self.transformer, override_path)
+
+        self._build_train_schedulers()
+        # Cache values needed by the loss / noise machinery.
+        self._patch_size = (1, 2, 2)  # va_shared_cfg.patch_size
+        self._snr_shift = 5.0  # va_libero_cfg.snr_shift
+        self._action_snr_shift = 0.05  # va_libero_cfg.action_snr_shift
+
+    def _build_train_schedulers(self) -> None:
+        from wan_va.utils import FlowMatchScheduler
+
+        self._train_scheduler_latent = FlowMatchScheduler(
+            shift=5.0, sigma_min=0.0, extra_one_step=True
+        )
+        self._train_scheduler_latent.set_timesteps(1000, training=True)
+        self._train_scheduler_action = FlowMatchScheduler(
+            shift=0.05, sigma_min=0.0, extra_one_step=True
+        )
+        self._train_scheduler_action.set_timesteps(1000, training=True)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        del gradient_checkpointing_kwargs
+        if self._ac_applied:
+            return
+        if not self.training_mode:
+            raise RuntimeError(
+                "gradient_checkpointing_enable is only valid in training_mode."
+            )
+        from wan_va.distributed.fsdp import apply_ac
+
+        apply_ac(self.transformer)
+        self._ac_applied = True
+
+    @torch.no_grad()
+    def _add_noise(
+        self,
+        latent: torch.Tensor,
+        train_scheduler,
+        action_mask: torch.Tensor | None = None,
+        action_mode: bool = False,
+        noisy_cond_prob: float = 0.0,
+    ) -> dict[str, torch.Tensor]:
+        """Sample flow-matching noise + timesteps. Mirrored from wan_va/train.py:_add_noise."""
+        from wan_va.utils import get_mesh_id, sample_timestep_id
+
+        B, _C, FrameDim, _H, _W = latent.shape
+        device = latent.device
+
+        timestep_ids = sample_timestep_id(
+            batch_size=FrameDim,
+            num_train_timesteps=train_scheduler.num_train_timesteps,
+        )
+        noise = torch.zeros_like(latent).normal_()
+        timesteps = train_scheduler.timesteps[timestep_ids].to(device=device)
+        noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
+        targets = train_scheduler.training_target(latent, noise, timesteps)
+
+        patch_f, patch_h, patch_w = self._patch_size
+        if action_mode:
+            patch_f = patch_h = patch_w = 1
+
+        latent_grid_id = get_mesh_id(
+            latent.shape[-3] // patch_f,
+            latent.shape[-2] // patch_h,
+            latent.shape[-1] // patch_w,
+            t=1 if action_mode else 0,
+            f_w=1,
+            f_shift=0,
+            action=action_mode,
+        ).to(device)
+        latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
+
+        if torch.rand(1).item() < noisy_cond_prob:
+            cond_timestep_ids = sample_timestep_id(
+                batch_size=FrameDim,
+                min_timestep_bd=0.5,
+                max_timestep_bd=1.0,
+                num_train_timesteps=train_scheduler.num_train_timesteps,
+            )
+            noise = torch.zeros_like(latent).normal_()
+            cond_timesteps = train_scheduler.timesteps[cond_timestep_ids].to(
+                device=device
+            )
+            latent = train_scheduler.add_noise(
+                latent, noise, cond_timesteps, t_dim=2
+            )
+        else:
+            cond_timesteps = torch.zeros_like(timesteps)
+
+        if action_mask is not None:
+            noisy_latents *= action_mask.float()
+            targets *= action_mask.float()
+            latent *= action_mask.float()
+
+        return dict(
+            timesteps=timesteps[None].repeat(B, 1),
+            noisy_latents=noisy_latents,
+            targets=targets,
+            latent=latent,
+            cond_timesteps=cond_timesteps[None].repeat(B, 1),
+            grid_id=latent_grid_id,
+        )
+
+    @torch.no_grad()
+    def _prepare_input_dict(self, batch_dict: dict) -> dict:
+        """Build the transformer input dict. Mirrored from wan_va/train.py:_prepare_input_dict."""
+        latent_dict = self._add_noise(
+            latent=batch_dict["latents"],
+            train_scheduler=self._train_scheduler_latent,
+            action_mask=None,
+            action_mode=False,
+            noisy_cond_prob=0.5,
+        )
+        action_dict = self._add_noise(
+            latent=batch_dict["actions"],
+            train_scheduler=self._train_scheduler_action,
+            action_mask=batch_dict["actions_mask"],
+            action_mode=True,
+            noisy_cond_prob=0.0,
+        )
+
+        latent_dict["text_emb"] = batch_dict["text_emb"]
+        action_dict["text_emb"] = batch_dict["text_emb"]
+        action_dict["actions_mask"] = batch_dict["actions_mask"]
+
+        return {
+            "latent_dict": latent_dict,
+            "action_dict": action_dict,
+            "chunk_size": torch.randint(1, 5, (1,)).item(),
+            "window_size": torch.randint(4, 65, (1,)).item(),
+        }
+
+    def _compute_loss(self, input_dict: dict, pred) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-frame flow-matching MSE on latent + action streams.
+
+        Mirrored from wan_va/train.py:compute_loss, but without the
+        ``/ gradient_accumulation_steps`` division (RLinf's FSDPSftWorker
+        handles grad-accumulation by dividing the loss internally).
+        """
+        from einops import rearrange
+        from wan_va.utils import data_seq_to_patch
+
+        latent_pred, action_pred = pred
+        action_pred = rearrange(
+            action_pred,
+            "b (f n) c -> b c f n 1",
+            f=input_dict["action_dict"]["targets"].shape[-3],
+        )
+        latent_pred = data_seq_to_patch(
+            self._patch_size,
+            latent_pred,
+            input_dict["latent_dict"]["targets"].shape[-3],
+            input_dict["latent_dict"]["targets"].shape[-2],
+            input_dict["latent_dict"]["targets"].shape[-1],
+            batch_size=latent_pred.shape[0],
+        )
+        Bn, Fn = input_dict["latent_dict"]["timesteps"].shape
+        latent_loss_weight = self._train_scheduler_latent.training_weight(
+            input_dict["latent_dict"]["timesteps"].flatten()
+        ).reshape(Bn, Fn)
+        action_loss_weight = self._train_scheduler_action.training_weight(
+            input_dict["action_dict"]["timesteps"].flatten()
+        ).reshape(Bn, Fn)
+
+        latent_loss = F.mse_loss(
+            latent_pred.float(),
+            input_dict["latent_dict"]["targets"].float().detach(),
+            reduction="none",
+        )
+        latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
+        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)
+        latent_loss = latent_loss.flatten(0, 1).flatten(1)
+        latent_loss_per_frame = latent_loss.sum(dim=1)
+        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)
+        latent_loss = (
+            latent_loss_per_frame / (latent_mask_per_frame + 1e-6)
+        ).mean()
+
+        action_loss = F.mse_loss(
+            action_pred.float(),
+            input_dict["action_dict"]["targets"].float().detach(),
+            reduction="none",
+        )
+        action_loss = action_loss * action_loss_weight[:, None, :, None, None]
+        action_loss = action_loss * input_dict["action_dict"]["actions_mask"].float()
+        action_loss = action_loss.permute(0, 2, 3, 4, 1)
+        action_mask = input_dict["action_dict"]["actions_mask"].float().permute(
+            0, 2, 3, 4, 1
+        )
+        action_loss = action_loss.flatten(0, 1).flatten(1)
+        action_mask = action_mask.flatten(0, 1).flatten(1)
+        action_loss_per_frame = action_loss.sum(dim=1)
+        action_mask_per_frame = action_mask.sum(dim=1)
+        action_loss = (
+            action_loss_per_frame / (action_mask_per_frame + 1e-6)
+        ).mean()
+
+        return latent_loss, action_loss
+
+    def sft_forward(self, data=None, **kwargs):
+        if data is None:
+            data = kwargs.get("data")
+        if data is None:
+            raise ValueError("sft_forward requires `data` from the SFT dataloader.")
+        if not self.training_mode:
+            raise RuntimeError(
+                "sft_forward called but cfg.lingbotva.training_mode is False."
+            )
+
+        device = next(self.transformer.parameters()).device
+        batch = {
+            k: v.to(device) for k, v in data.items() if torch.is_tensor(v)
+        }
+        input_dict = self._prepare_input_dict(batch)
+        output = self.transformer(input_dict, train_mode=True)
+        latent_loss, action_loss = self._compute_loss(input_dict, output)
+        return {
+            "loss": latent_loss + action_loss,
+            "latent_loss": latent_loss.detach(),
+            "action_loss": action_loss.detach(),
+        }
+
+    # ------------------------------------------------------------------
+    # Eval path (unchanged from the milestone-1 integration)
+    # ------------------------------------------------------------------
+
     def _ensure_backend(self) -> LingbotVALiberoBackend:
+        if self.training_mode:
+            raise RuntimeError(
+                "Eval backend not available in training_mode; call sft_forward instead."
+            )
         if self._backend is None:
             self._backend = LingbotVALiberoBackend(self.config, self.torch_dtype)
         return self._backend
@@ -170,6 +460,11 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         if mode != "eval":
             raise NotImplementedError(
                 "LingBot-VA Libero adapter only supports eval mode."
+            )
+        if self.training_mode:
+            raise RuntimeError(
+                "predict_action_batch is unavailable while training_mode=True; "
+                "the eval backend is not initialised."
             )
         states_tensor = env_obs.get("states")
         if states_tensor is None:

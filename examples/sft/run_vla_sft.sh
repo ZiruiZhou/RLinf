@@ -12,6 +12,11 @@ export PYTHONPATH=${REPO_PATH}:${LIBERO_REPO_PATH}:$PYTHONPATH
 export DREAMZERO_PATH=${DREAMZERO_PATH:-"/path/to/DreamZero"}
 export PYTHONPATH=${DREAMZERO_PATH}:$PYTHONPATH
 
+export LINGBOT_VA_REPO_PATH=${LINGBOT_VA_REPO_PATH:-"/workspace/zirui/lingbot-va"}
+export LINGBOT_VA_MODEL_PATH=${LINGBOT_VA_MODEL_PATH:-"/workspace/zirui/models/lingbot-va-base"}
+export LINGBOT_VA_DATASET_PATH=${LINGBOT_VA_DATASET_PATH:-"/workspace/zirui/lingbot-va/datasets/libero_object_10x10_seed42"}
+export PYTHONPATH=${LINGBOT_VA_REPO_PATH}:$PYTHONPATH
+
 if [ -z "$1" ]; then
     CONFIG_NAME="maniskill_ppo_openvlaoft"
 else
