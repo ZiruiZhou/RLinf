@@ -17,3 +17,9 @@ lingbotva:
   training_mode: false
   cfg_prob: 0.1
   empty_emb_path: null
+  # Attention backend for the transformer at load time. Eval uses "torch"
+  # (SDPA) — the per-step inference loop is not compatible with
+  # flex_attention's block-mask layout. SFT can use "flex" on torch>=2.9
+  # to match the reference recipe; on older torch the SFT YAML overrides
+  # to "torch" to dodge the flex_attention+inductor codegen bug.
+  attn_mode: torch

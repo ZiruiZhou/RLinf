@@ -127,14 +127,25 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         from wan_va.modules.utils import load_transformer
 
         transformer_path = os.path.join(self.config.model_path, "transformer")
-        # Match `wan_va/train.py:84-89` — load fp32 on CPU; mixed precision in
-        # FSDP and the bf16 cast in the worker handle dtype conversion.
+        # The reference recipe loads fp32 then immediately casts to bf16 in
+        # `shard_model` (`model.to(dtype).cuda()`). We collapse that into a
+        # single bf16 load to keep peak host memory low and to avoid a 5 B
+        # fp32 model ever landing on the GPU.
+        # `attn_mode` defaults to "flex" to match the reference run; on
+        # torch < 2.9 the flex_attention + inductor combination hits a
+        # known codegen bug, so callers can override to "torch" (SDPA).
+        attn_mode = getattr(self.config.lingbotva, "attn_mode", "flex")
         self.transformer = load_transformer(
             transformer_path,
-            torch_dtype=torch.float32,
+            torch_dtype=self.torch_dtype,
             torch_device="cpu",
-            attn_mode="flex",
+            attn_mode=attn_mode,
         )
+        # `from_pretrained(torch_dtype=...)` casts checkpoint tensors but
+        # leaves freshly-initialised parameters (e.g. `scale_shift_table`)
+        # in their default fp32. FSDP1's flat-param refuses to flatten a
+        # module with mixed dtypes, so force the whole module to bf16.
+        self.transformer.to(dtype=self.torch_dtype)
 
         # Optional SFT-checkpoint override (rare for first-stage SFT; useful
         # when resuming or fine-tuning further).
