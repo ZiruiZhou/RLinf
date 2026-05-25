@@ -92,9 +92,13 @@ actor:
       transformer_state_dict_path: ${oc.env:LINGBOT_VA_TRANSFORMER_STATE_DICT_PATH,null}
       empty_emb_path: ${oc.env:LINGBOT_VA_EMPTY_EMB_PATH,null}
       cfg_prob: 0.1
-      # "torch" (SDPA) sidesteps the torch<2.9 flex_attention codegen bug.
-      # Flip back to "flex" on torch>=2.9 for reference-recipe parity.
-      attn_mode: torch
+      # "flex" matches the reference recipe (flex_attention with BlockMask
+      # enforcing the chunk/window/noise-typed attention pattern). On
+      # torch<2.9 the flex_attention+inductor pipeline hits a codegen bug;
+      # the prior workaround was attn_mode=torch, but SDPA ignores the
+      # BlockMask which leaks clean ground-truth tokens to noisy queries
+      # at training time (eval gets 0% SR). Requires torch>=2.9.
+      attn_mode: flex
       save_root: ./runtime/lingbotva_sft
 
   optim:
