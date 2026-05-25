@@ -17,6 +17,11 @@ export LINGBOT_VA_MODEL_PATH=${LINGBOT_VA_MODEL_PATH:-"/workspace/zirui/models/l
 export LINGBOT_VA_DATASET_PATH=${LINGBOT_VA_DATASET_PATH:-"/workspace/zirui/lingbot-va/datasets/libero_object_10x10_seed42"}
 export PYTHONPATH=${LINGBOT_VA_REPO_PATH}:$PYTHONPATH
 
+# Required by the 5B-param transformer to fit alongside activations on a
+# single GPU; without this the allocator fragments and OOMs during model
+# wrap or first forward.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-"expandable_segments:True"}
+
 if [ -z "$1" ]; then
     CONFIG_NAME="maniskill_ppo_openvlaoft"
 else

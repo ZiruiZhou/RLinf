@@ -10,6 +10,24 @@
 # Matches the reference single-A100 recipe documented in eval-dev-summary.md:
 #   lr=1e-5, betas=(0.9, 0.95), wd=1e-1, batch=1 x grad_accum=10, 3000 steps,
 #   AdamW8bit, activation checkpointing, bf16 params, no FSDP shard at ws=1.
+#
+# Known issues / workarounds folded into this config:
+#   * fsdp_config.strategy: fsdp (FSDP1) + use_orig_params: True
+#       FSDP2's `fully_shard` always converts params to DTensors even with
+#       sharding_strategy=no_shard, which crashes bitsandbytes.AdamW8bit.
+#       FSDP1 with NO_SHARD + use_orig_params keeps parameters as plain
+#       Tensors that bnb accepts.
+#   * lingbotva.attn_mode: flex
+#       Matches the reference recipe (flex_attention with BlockMask
+#       enforcing the chunk/window/noise-typed attention pattern).
+#       Requires torch >= 2.9 - earlier versions hit a flex_attention
+#       + inductor codegen bug ("NameError: name 's10' is not defined").
+#       attn_mode: torch (SDPA) is NOT a valid fallback: SDPA silently
+#       drops the BlockMask, leaking clean ground-truth tokens into
+#       noisy queries at training time, which collapses eval SR to 0%.
+#   * Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the launch
+#     shell (run_vla_sft.sh exports it) - the 5B-param transformer needs
+#     expandable allocator to fit alongside activations.
 defaults:
   - model/lingbotva@actor.model
   - training_backend/fsdp@actor.fsdp_config
@@ -77,6 +95,13 @@ actor:
       transformer_state_dict_path: ${oc.env:LINGBOT_VA_TRANSFORMER_STATE_DICT_PATH,null}
       empty_emb_path: ${oc.env:LINGBOT_VA_EMPTY_EMB_PATH,null}
       cfg_prob: 0.1
+      # "flex" matches the reference recipe (flex_attention with BlockMask
+      # enforcing the chunk/window/noise-typed attention pattern). On
+      # torch<2.9 the flex_attention+inductor pipeline hits a codegen bug;
+      # the prior workaround was attn_mode=torch, but SDPA ignores the
+      # BlockMask which leaks clean ground-truth tokens to noisy queries
+      # at training time (eval gets 0% SR). Requires torch>=2.9.
+      attn_mode: flex
       save_root: ./runtime/lingbotva_sft
 
   optim:
@@ -92,10 +117,11 @@ actor:
     total_training_steps: 3000
 
   fsdp_config:
-    strategy: "fsdp2"
-    # Critical for bnb AdamW8bit: FSDP2's DTensor wrap is incompatible with
-    # bitsandbytes' quantized optimizer state, and at ws=1 sharding offers
-    # nothing anyway.
+    # FSDP1 instead of FSDP2: FSDP2's `fully_shard` converts params to
+    # DTensors even with sharding_strategy=no_shard, which crashes
+    # bitsandbytes.AdamW8bit. FSDP1 + NO_SHARD + use_orig_params keeps
+    # the parameters as plain Tensors that bnb's CUDA kernels accept.
+    strategy: "fsdp"
     sharding_strategy: "no_shard"
     use_orig_params: True
     gradient_checkpointing: True

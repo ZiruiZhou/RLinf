@@ -236,6 +236,14 @@ def main():
         help="If set, restrict the env to this libero_object task id (0-9).",
     )
     parser.add_argument(
+        "--transformer-state-dict-path",
+        default=os.environ.get("LINGBOT_VA_TRANSFORMER_STATE_DICT_PATH"),
+        help="Optional path to a transformer state dict (.pt/.pth file or HF-style "
+        "checkpoint dir). When set, overrides the transformer weights in --model-path "
+        "after building the eval backend. Used to evaluate an SFT checkpoint produced "
+        "by RLinf's SFT pipeline (e.g. .../actor/model_state_dict/full_weights.pt).",
+    )
+    parser.add_argument(
         "--results-path",
         default="./runtime/lingbotva_libero_eval/results.json",
     )
@@ -247,9 +255,14 @@ def main():
     task_id_filter = [args.task_id] if args.task_id is not None else None
     print(
         f"[lingbotva-libero-eval] num_envs={args.num_envs} num_episodes={args.num_episodes} "
-        f"task_id_filter={task_id_filter}"
+        f"task_id_filter={task_id_filter} "
+        f"transformer_state_dict_path={args.transformer_state_dict_path}"
     )
-    model = build_model(args.model_path, args.repo_path)
+    model = build_model(
+        args.model_path,
+        args.repo_path,
+        transformer_state_dict_path=args.transformer_state_dict_path,
+    )
     model = model.cuda()
     env = build_libero_env(
         num_envs=args.num_envs, seed=args.seed, task_id_filter=task_id_filter
