@@ -1,0 +1,138 @@
+# SFT training of LingBot-VA on Libero-Object.
+#
+# Prerequisites (run inside the lingbot-va repo before launching this config):
+#   1. Download yifengzhu-hf/LIBERO-datasets (NOT IPEC-COMMUNITY) HDF5 files.
+#   2. Convert HDF5 -> LeRobot v2.1 via scripts/convert_libero_object_to_lerobot.py.
+#   3. Subsample 10 demos x 10 tasks via scripts/select_subset.py --per-task 10 --seed 42.
+#   4. Extract Wan2.2 VAE latents + UMT5 empty embedding via scripts/extract_latents.py.
+# The resulting directory becomes ${LINGBOT_VA_DATASET_PATH}.
+#
+# Matches the reference single-A100 recipe documented in eval-dev-summary.md:
+#   lr=1e-5, betas=(0.9, 0.95), wd=1e-1, batch=1 x grad_accum=10, 3000 steps,
+#   AdamW8bit, activation checkpointing, bf16 params, no FSDP shard at ws=1.
+#
+# Known issues / workarounds folded into this config:
+#   * fsdp_config.strategy: fsdp (FSDP1) + use_orig_params: True
+#       FSDP2's `fully_shard` always converts params to DTensors even with
+#       sharding_strategy=no_shard, which crashes bitsandbytes.AdamW8bit.
+#       FSDP1 with NO_SHARD + use_orig_params keeps parameters as plain
+#       Tensors that bnb accepts.
+#   * lingbotva.attn_mode: flex
+#       Matches the reference recipe (flex_attention with BlockMask
+#       enforcing the chunk/window/noise-typed attention pattern).
+#       Requires torch >= 2.9 - earlier versions hit a flex_attention
+#       + inductor codegen bug ("NameError: name 's10' is not defined").
+#       attn_mode: torch (SDPA) is NOT a valid fallback: SDPA silently
+#       drops the BlockMask, leaking clean ground-truth tokens into
+#       noisy queries at training time, which collapses eval SR to 0%.
+#   * Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the launch
+#     shell (run_vla_sft.sh exports it) - the 5B-param transformer needs
+#     expandable allocator to fit alongside activations.
+defaults:
+  - model/lingbotva@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_sft_lingbotva"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: -1
+  max_steps: 3000
+  val_check_interval: -1
+  save_interval: 1000
+  log_interval: 1
+
+data:
+  train_data_paths: ${oc.env:LINGBOT_VA_DATASET_PATH}
+  num_workers: 4
+  prefetch_factor: 2
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  # global_batch_size / (micro_batch_size * world_size) = gradient_accumulation.
+  # With ws=1 and micro=1, set global=10 to match the reference grad_accum=10.
+  global_batch_size: 10
+  seed: 42
+  dataloader_num_workers: 4
+  enable_offload: False
+
+  model:
+    model_type: "lingbotva"
+    precision: bf16
+    model_path: ${oc.env:LINGBOT_VA_MODEL_PATH}
+    num_action_chunks: 12
+    action_dim: 7
+    is_lora: False
+    add_value_head: False
+    lingbotva:
+      repo_path: ${oc.env:LINGBOT_VA_REPO_PATH}
+      config_name: libero
+      training_mode: true
+      enable_offload: false
+      action_per_frame: 4
+      transformer_state_dict_path: ${oc.env:LINGBOT_VA_TRANSFORMER_STATE_DICT_PATH,null}
+      empty_emb_path: ${oc.env:LINGBOT_VA_EMPTY_EMB_PATH,null}
+      cfg_prob: 0.1
+      # "flex" matches the reference recipe (flex_attention with BlockMask
+      # enforcing the chunk/window/noise-typed attention pattern). On
+      # torch<2.9 the flex_attention+inductor pipeline hits a codegen bug;
+      # the prior workaround was attn_mode=torch, but SDPA ignores the
+      # BlockMask which leaks clean ground-truth tokens to noisy queries
+      # at training time (eval gets 0% SR). Requires torch>=2.9.
+      attn_mode: flex
+      save_root: ./runtime/lingbotva_sft
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-1
+    clip_grad: 2.0
+    optimizer_type: adamw_8bit
+    lr_scheduler: constant
+    lr_warmup_steps: 10
+    total_training_steps: 3000
+
+  fsdp_config:
+    # FSDP1 instead of FSDP2: FSDP2's `fully_shard` converts params to
+    # DTensors even with sharding_strategy=no_shard, which crashes
+    # bitsandbytes.AdamW8bit. FSDP1 + NO_SHARD + use_orig_params keeps
+    # the parameters as plain Tensors that bnb's CUDA kernels accept.
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: True
+    gradient_checkpointing: True
+    limit_all_gathers: True
+    reshard_after_forward: False
+    grad_scaler:
+      enabled: False
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: bf16
+    amp_autocast:
+      enabled: false
+      precision: "bf16"
