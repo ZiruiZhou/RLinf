@@ -141,7 +141,10 @@ actor:
     model_type: lingbotva
     model_path: ${oc.env:LINGBOT_VA_MODEL_PATH}
     precision: bf16
-    num_action_chunks: 12
+    # SFT trains with num_action_chunks=12; eval uses 16 to match the
+    # verified per-task SR baseline. The model can predict an arbitrary
+    # number of chunks per inference call.
+    num_action_chunks: 16
     action_dim: 7
     lingbotva:
       repo_path: ${oc.env:LINGBOT_VA_REPO_PATH}
@@ -154,6 +157,11 @@ actor:
       # = use the transformer shipped under ${actor.model.model_path}).
       transformer_state_dict_path: ${oc.env:LINGBOT_VA_TRANSFORMER_STATE_DICT_PATH,null}
       save_root: ./runtime/lingbotva
+      # Cross-chunk KV-cache replay. Eval relies on the per-chunk
+      # record_chunk_observations / reset_episode hooks driven by
+      # eval_lingbotva.py; without this the model loses its inter-chunk
+      # memory and SR collapses to ~0%.
+      enable_kv_cache_replay: True
 
   optim:
     lr: 5.0e-05
