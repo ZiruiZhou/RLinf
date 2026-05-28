@@ -53,7 +53,10 @@ git clone https://github.com/ZiruiZhou/RLinf.git
 cd RLinf
 git checkout feat/lingbotva-libero-object-sft
 
-# lingbot-va peer repo (provides wan_va Python package + data prep scripts)
+# lingbot-va peer repo (provides the wan_va Python package — needed at
+# runtime by both training and the dataset-prep `extract_latents.py`).
+# The data-prep scripts themselves now live under
+# `toolkits/data_scripts_lingbotva/` in this RLinf clone.
 git clone https://github.com/robbyant/lingbot-va.git <LINGBOT_VA_REPO_PATH>
 ```
 
@@ -177,24 +180,28 @@ export LIBERO_RAW_DIR=<your-libero-raw-dir>
 huggingface-cli download yifengzhu-hf/LIBERO-datasets --local-dir ${LIBERO_RAW_DIR}
 ```
 
-### 5.2 Run the four conversion scripts
+### 5.2 Run the three conversion scripts
+
+The scripts live under `toolkits/data_scripts_lingbotva/` in this repo;
+see that directory's README for details on each step's inputs and
+outputs.
 
 ```bash
-cd ${LINGBOT_VA_REPO_PATH}
+cd ${REPO_PATH}
 
 # (a) HDF5 → LeRobot v2.1 format
-python script/convert_libero_object_to_lerobot.py \
+python toolkits/data_scripts_lingbotva/convert_libero_object_to_lerobot.py \
   --hdf5-root ${LIBERO_RAW_DIR}/libero_object \
   --output ${LINGBOT_VA_DATASET_PATH}_full
 
 # (b) Subsample to 10 demos × 10 tasks (deterministic via seed 42)
-python script/select_subset.py \
+python toolkits/data_scripts_lingbotva/select_subset.py \
   --src ${LINGBOT_VA_DATASET_PATH}_full \
   --dst ${LINGBOT_VA_DATASET_PATH} \
   --per-task 10 --seed 42
 
 # (c) Extract Wan 2.2 VAE latents + cache the UMT5 empty-prompt embedding
-python script/extract_latents.py \
+python toolkits/data_scripts_lingbotva/extract_latents.py \
   --dataset ${LINGBOT_VA_DATASET_PATH} \
   --model-path ${LINGBOT_VA_MODEL_PATH}
 ```

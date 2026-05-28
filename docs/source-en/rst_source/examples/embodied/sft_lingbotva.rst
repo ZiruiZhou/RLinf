@@ -64,7 +64,7 @@ Environment
      pip install -e ${REPO_PATH}
      pip install -r ${REPO_PATH}/requirements/embodied/models/lingbotva.txt
 
-3. Clone the lingbot-va peer repository (provides the ``wan_va`` Python package and data-prep scripts) and install in editable mode::
+3. Clone the lingbot-va peer repository (provides the ``wan_va`` Python package — needed at runtime by both training and the dataset-prep ``extract_latents.py``; the data-prep scripts themselves now live under ``toolkits/data_scripts_lingbotva/`` in this RLinf clone) and install in editable mode::
 
      git clone https://github.com/robbyant/lingbot-va.git <LINGBOT_VA_REPO_PATH>
      pip install -e <LINGBOT_VA_REPO_PATH>
@@ -106,25 +106,27 @@ The training dataset is a LeRobot v2.1 conversion of 100 Libero-Object demonstra
       export LIBERO_RAW_DIR=<your-libero-raw-dir>
       huggingface-cli download yifengzhu-hf/LIBERO-datasets --local-dir ${LIBERO_RAW_DIR}
 
-2. Run the three lingbot-va conversion scripts. From the lingbot-va checkout:
+2. Run the three conversion scripts shipped under
+   ``toolkits/data_scripts_lingbotva/``. See that directory's
+   ``README.md`` for inputs / outputs of each step.
 
    .. code:: bash
 
-      cd ${LINGBOT_VA_REPO_PATH}
+      cd ${REPO_PATH}
 
       # (a) HDF5 -> LeRobot v2.1 format
-      python script/convert_libero_object_to_lerobot.py \
+      python toolkits/data_scripts_lingbotva/convert_libero_object_to_lerobot.py \
         --hdf5-root ${LIBERO_RAW_DIR}/libero_object \
         --output ${LINGBOT_VA_DATASET_PATH}_full
 
       # (b) Subsample to 10 demos x 10 tasks (deterministic via seed 42)
-      python script/select_subset.py \
+      python toolkits/data_scripts_lingbotva/select_subset.py \
         --src ${LINGBOT_VA_DATASET_PATH}_full \
         --dst ${LINGBOT_VA_DATASET_PATH} \
         --per-task 10 --seed 42
 
       # (c) Extract Wan 2.2 VAE latents + cache the UMT5 empty-prompt embedding
-      python script/extract_latents.py \
+      python toolkits/data_scripts_lingbotva/extract_latents.py \
         --dataset ${LINGBOT_VA_DATASET_PATH} \
         --model-path ${LINGBOT_VA_MODEL_PATH}
 
