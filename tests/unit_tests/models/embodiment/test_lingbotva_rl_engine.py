@@ -142,11 +142,20 @@ def test_sde_mean_std_per_sample_index():
 # ---------------------------------------------------------------------------
 # logprob reduction / broadcast
 # ---------------------------------------------------------------------------
-def test_reduce_chain_logprob_sums_non_batch_dims():
+def test_reduce_chain_logprob_means_active_coords():
+    # Mean over the active (nonzero) coordinates: all-ones -> 1.0.
     x = torch.ones(3, 7, 4, 4, 1)
     out = reduce_chain_logprob(x)
     assert out.shape == (3,)
-    assert torch.allclose(out, torch.full((3,), float(7 * 4 * 4 * 1)))
+    assert torch.allclose(out, torch.ones(3))
+
+
+def test_reduce_chain_logprob_ignores_masked_zeros():
+    # Masked (std==0) coordinates are exactly 0 and must not dilute the mean.
+    x = torch.zeros(2, 4, 4)
+    x[:, 0, :] = 2.0  # 4 active coords per sample, rest masked
+    out = reduce_chain_logprob(x)
+    assert torch.allclose(out, torch.full((2,), 2.0))
 
 
 def test_broadcast_logprob_shape_and_values():

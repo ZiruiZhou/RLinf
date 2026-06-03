@@ -279,13 +279,27 @@ def sde_mean_std(
 
 
 def reduce_chain_logprob(per_elem_logprob: torch.Tensor) -> torch.Tensor:
-    """Sum a per-element Gaussian log-density to one log-prob per sample.
+    """Reduce a per-element Gaussian log-density to one log-prob per sample.
 
-    The action latent has shape ``[B, ...]``; the diffusion-step transition is
-    a single joint Gaussian over all latent coordinates, so its log-prob is the
-    sum over every non-batch dim. Returns ``[B]``.
+    The action latent has shape ``[B, ...]``; the diffusion-step transition is a
+    joint Gaussian over all latent coordinates. The joint log-prob is the SUM
+    over coordinates, but in the distributed GRPO setting the rollout samples
+    with the unsharded bf16 transformer while the actor recomputes with the
+    FSDP-sharded copy. Those two bf16 forwards agree only to ~1e-3 per element;
+    summed over ~112 unmasked coordinates that becomes a multi-nat difference,
+    and ``exp(logprob_new - logprob_old)`` blows the PPO ratio up to 1e4-1e15
+    even at identical weights (the rollout/recompute consistency gate).
+
+    We therefore return the per-coordinate MEAN over the *active* (non-masked)
+    coordinates instead of the sum. ``gaussian_logprob`` returns exactly 0 where
+    ``std == 0`` (masked / deterministic coordinates), so we average over the
+    nonzero entries. Rollout and recompute apply this identically and mask the
+    same coordinates, so the ratio is unchanged in expectation but ~112x less
+    sensitive to bf16 forward noise. Returns ``[B]``.
     """
-    return per_elem_logprob.flatten(1).sum(dim=1)
+    flat = per_elem_logprob.flatten(1)
+    count = (flat != 0).sum(dim=1).clamp(min=1)
+    return flat.sum(dim=1) / count
 
 
 def broadcast_logprob_to_actions(
