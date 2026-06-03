@@ -639,32 +639,28 @@ class LingbotVALiberoBackend:
         torch.cuda.empty_cache()
         return self._postprocess_action_batch(actions)
 
-    def _compute_kv_cache_batch_impl(
+    def _replay_kv_cache_entry(
         self,
-        *,
-        obs_batch: list[list[dict[str, Any]]],
-        state_batch: np.ndarray,
+        latent_model_input: torch.Tensor,
+        action_model_input: torch.Tensor,
         frame_st_id: int,
     ) -> int:
+        """Write one history entry into the KV cache from PRE-COMPUTED tensors.
+
+        The cache-only forwards (``update_cache=2``) the action step later reads
+        depend solely on ``latent_model_input`` (post VAE-encode and, on the
+        first entry, the prepended ``init_latent``) and ``action_model_input``
+        (post action preprocessing) — NOT on the raw obs. So the RL recompute
+        can reproduce the exact same cache from the stored tensors without
+        re-running the VAE. Returns the advanced ``frame_st_id``.
+        """
         server = self._server
         server.transformer.clear_pred_cache(server.cache_name)
-        latent_model_input = self._encode_obs_batch(obs_batch)
-        if frame_st_id == 0:
-            latent_model_input = (
-                torch.cat([server.init_latent, latent_model_input], dim=2)
-                if latent_model_input is not None
-                else server.init_latent
-            )
-
-        action_model_input = self._preprocess_action_batch(state_batch).to(
-            latent_model_input
-        )
         input_dict = self._prepare_batch_input(
             latent_model_input=latent_model_input,
             action_model_input=action_model_input,
             frame_st_id=frame_st_id,
         )
-
         with torch.no_grad():
             server.transformer(
                 input_dict["latent_res_lst"],
@@ -678,8 +674,42 @@ class LingbotVALiberoBackend:
                 cache_name=server.cache_name,
                 action_mode=True,
             )
-        torch.cuda.empty_cache()
         return frame_st_id + int(latent_model_input.shape[2])
+
+    def _compute_kv_cache_batch_impl(
+        self,
+        *,
+        obs_batch: list[list[dict[str, Any]]],
+        state_batch: np.ndarray,
+        frame_st_id: int,
+        capture: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> int:
+        server = self._server
+        latent_model_input = self._encode_obs_batch(obs_batch)
+        if frame_st_id == 0:
+            latent_model_input = (
+                torch.cat([server.init_latent, latent_model_input], dim=2)
+                if latent_model_input is not None
+                else server.init_latent
+            )
+
+        action_model_input = self._preprocess_action_batch(state_batch).to(
+            latent_model_input
+        )
+        if capture is not None:
+            # Stash the exact cache-writing tensors so the RL recompute can
+            # replay this entry deterministically (see _replay_kv_cache_entry).
+            capture.append(
+                (
+                    latent_model_input.detach().to("cpu"),
+                    action_model_input.detach().to("cpu"),
+                )
+            )
+        new_frame_st_id = self._replay_kv_cache_entry(
+            latent_model_input, action_model_input, frame_st_id
+        )
+        torch.cuda.empty_cache()
+        return new_frame_st_id
 
     def infer_batch(
         self,
@@ -900,6 +930,69 @@ class LingbotVALiberoBackend:
             std[:, :, 0:1] = 0.0
         return std
 
+    def _pack_history(
+        self,
+        history_capture: list[tuple[torch.Tensor, torch.Tensor]],
+        batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        """Pack the captured per-entry cache tensors into fixed-shape blocks.
+
+        The actor's trajectory pipeline concatenates ``forward_inputs`` across
+        chunks, so the history block must have a constant shape regardless of
+        how many entries this chunk actually replayed. We therefore pad to a
+        config-fixed ``H_max`` entries / ``T_max`` total latent frames:
+
+          * ``history_latents`` ``[B, C, T_max, h, w]`` — every entry's cache
+            latent concatenated along the frame dim, zero-padded.
+          * ``history_actions`` ``[B, H_max, A, FC, APF, 1]`` — per-entry action
+            input, zero-padded.
+          * ``history_lat_frames`` ``[B, H_max]`` long — frames per entry (0 for
+            padding); used to slice ``history_latents`` and advance frame_st_id.
+          * ``history_len`` ``[B]`` long — number of valid entries.
+        """
+        server = self._server
+        H_max = int(getattr(self.cfg.lingbotva, "kv_replay_max_history", 24))
+        T_max = int(getattr(self.cfg.lingbotva, "kv_replay_max_frames", 80))
+        il = server.init_latent
+        ch, lat_h, lat_w = int(il.shape[1]), int(il.shape[-2]), int(il.shape[-1])
+        dtype = il.dtype
+        H = len(history_capture)
+
+        history_latents = torch.zeros(
+            batch_size, ch, T_max, lat_h, lat_w, dtype=dtype
+        )
+        history_lat_frames = torch.zeros(batch_size, H_max, dtype=torch.long)
+        if H > 0:
+            act_shape = tuple(history_capture[0][1].shape[1:])  # [A, FC, APF, 1]
+            history_actions = torch.zeros(
+                batch_size, H_max, *act_shape, dtype=dtype
+            )
+            offset = 0
+            for i, (lat_i, act_i) in enumerate(history_capture):
+                t_i = int(lat_i.shape[2])
+                if offset + t_i > T_max:
+                    raise ValueError(
+                        f"KV-replay history frames {offset + t_i} exceed "
+                        f"kv_replay_max_frames={T_max}; raise the config knob."
+                    )
+                history_latents[:, :, offset : offset + t_i] = lat_i.to(dtype)
+                history_lat_frames[:, i] = t_i
+                history_actions[:, i] = act_i.to(dtype)
+                offset += t_i
+        else:
+            a = int(server.job_config.action_dim)
+            fc = int(server.job_config.frame_chunk_size)
+            apf = int(server.action_per_frame)
+            history_actions = torch.zeros(
+                batch_size, H_max, a, fc, apf, 1, dtype=dtype
+            )
+        return {
+            "history_latents": history_latents.cpu(),
+            "history_actions": history_actions.cpu(),
+            "history_lat_frames": history_lat_frames.cpu(),
+            "history_len": torch.full((batch_size,), H, dtype=torch.long),
+        }
+
     def infer_batch_with_logprob(
         self,
         obs_batch: list[dict[str, Any]],
@@ -935,6 +1028,12 @@ class LingbotVALiberoBackend:
         frame_st_id = 0
         obs_sequences = self._normalize_obs_sequences(obs_batch)
         batch_size = len(obs_sequences)
+        # Capture each replayed entry's exact cache-writing tensors so the actor
+        # recompute can reproduce the same KV cache (see recompute_logprob).
+        history_capture: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # Must equal _pack_history's H_max so the rollout replays exactly the
+        # entries that get stored for recompute (recompute consistency).
+        max_history = int(getattr(self.cfg.lingbotva, "kv_replay_max_history", 24))
 
         with torch.no_grad():
             # Replay prior chunks into the KV cache (mirrors infer_batch).
@@ -946,8 +1045,12 @@ class LingbotVALiberoBackend:
                         f"lengths across the batch, got {history_lengths}."
                     )
                 history_len = history_lengths.pop()
+                # Cap to the most recent ``max_history`` entries so both the
+                # rollout AND the recompute (which stores a fixed-size history
+                # block) replay the SAME context — recompute consistency.
+                start = max(0, history_len - max_history)
                 server.init_latent = self._encode_obs_batch(obs_batch)
-                for history_idx in range(history_len):
+                for history_idx in range(start, history_len):
                     hist_obs = [h[history_idx][0] for h in kv_cache_histories]
                     state_batch = np.stack(
                         [h[history_idx][1] for h in kv_cache_histories], axis=0
@@ -956,6 +1059,7 @@ class LingbotVALiberoBackend:
                         obs_batch=hist_obs,
                         state_batch=state_batch,
                         frame_st_id=frame_st_id,
+                        capture=history_capture,
                     )
             else:
                 server.init_latent = self._encode_obs_batch(obs_sequences)
@@ -1028,6 +1132,7 @@ class LingbotVALiberoBackend:
         if logprob is None:
             raise RuntimeError("RL rollout did not score any denoise step.")
         raw_actions = self._postprocess_action_batch(actions)
+        history_pack = self._pack_history(history_capture, batch_size)
         torch.cuda.empty_cache()
         return {
             "actions": raw_actions,
@@ -1047,7 +1152,38 @@ class LingbotVALiberoBackend:
             "noise_level": float(noise_level),
             "num_action_steps": num_action_steps,
             "action_dim": server.job_config.action_dim,
+            # Cache-replay history for recompute consistency (task #4 / #2).
+            **history_pack,
         }
+
+    def _replay_history_cache(
+        self, fi: RLForwardInputs, batch_size: int
+    ) -> int:
+        """Replay the stored history entries into the KV cache (no grad).
+
+        Mirrors the rollout's per-entry ``_compute_kv_cache_batch_impl`` loop
+        using the stored (already encoded + init-prepended) tensors. Returns the
+        cumulative ``frame_st_id`` after replay (0 when there is no history).
+
+        Assumes a homogeneous micro-batch (the RL config pins
+        ``micro_batch_size == 1``), so the per-entry frame counts are read from
+        sample 0.
+        """
+        if fi.history_len is None or fi.history_latents is None:
+            return 0
+        hist_len = int(fi.history_len[0].item())
+        if hist_len <= 0:
+            return 0
+        frames = fi.history_lat_frames[0]  # [H_max] per-entry latent frames
+        frame_st_id = 0
+        offset = 0
+        for i in range(hist_len):
+            t_i = int(frames[i].item())
+            lat_i = fi.history_latents[:, :, offset : offset + t_i]
+            act_i = fi.history_actions[:, i]
+            frame_st_id = self._replay_kv_cache_entry(lat_i, act_i, frame_st_id)
+            offset += t_i
+        return frame_st_id
 
     def recompute_logprob(
         self,
@@ -1067,6 +1203,51 @@ class LingbotVALiberoBackend:
         server = self._server
         fi = forward_inputs.to(server.device)
         batch_size = fi.action_chains.shape[0]
+
+        # Group rows that share (frame_st_id, denoise_ind): they have identical
+        # history structure and scored timestep, so each group recomputes as ONE
+        # batched forward. This amortizes the FSDP all-gather over the whole
+        # group (~chunk-size speedup vs the per-sample micro_batch_size=1 path)
+        # while staying exact, and transparently supports heterogeneous
+        # micro-batches (mixed chunks) without per-sample action timesteps.
+        keys = (fi.frame_st_id.to(torch.long) << 20) + fi.denoise_inds.to(torch.long)
+        order: list[torch.Tensor] = []
+        logp_parts: list[torch.Tensor] = []
+        ent_parts: list[torch.Tensor] = []
+        for key in torch.unique(keys):
+            idx = torch.nonzero(keys == key, as_tuple=False).flatten()
+            out = self._recompute_group(
+                fi.index_select(idx),
+                compute_entropy=compute_entropy,
+            )
+            order.append(idx)
+            logp_parts.append(out["logprobs"])
+            ent_parts.append(out["entropy"])
+
+        order_cat = torch.cat(order)
+        inv = torch.empty_like(order_cat)
+        inv[order_cat] = torch.arange(batch_size, device=order_cat.device)
+        logprobs = torch.cat(logp_parts)[inv]
+        entropy = torch.cat(ent_parts)[inv]
+        values = torch.zeros(batch_size, device=server.device)  # GRPO: critic-free
+        return {"logprobs": logprobs, "entropy": entropy, "values": values}
+
+    def _recompute_group(
+        self,
+        fi: RLForwardInputs,
+        *,
+        compute_entropy: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Recompute one homogeneous group (single frame_st_id + denoise_ind).
+
+        Re-commits the single video-cache entry deterministically (after
+        replaying the stored history KV cache), then re-runs the one stored
+        action-denoise step through the (trainable) transformer. Gradients flow
+        through the action step only; the conditioning is run under ``no_grad``,
+        mirroring how OpenPI/lingbotvla detach the prefix.
+        """
+        server = self._server
+        batch_size = fi.action_chains.shape[0]
         denoise_inds = fi.denoise_inds.to(torch.long)
         num_action_steps = fi.scalar_num_action_steps
         frame_st_id = fi.scalar_frame_st_id
@@ -1078,6 +1259,19 @@ class LingbotVALiberoBackend:
         server.negative_prompt_embeds = fi.negative_prompt_embeds
 
         with torch.no_grad():
+            # Replay the prior chunks' KV cache that the rollout's scored action
+            # step attended to. Each stored entry's latent already includes the
+            # first-chunk init_latent prepend (captured post-prepend at rollout),
+            # so we replay them verbatim, advancing frame_st_id from 0. Without
+            # this the action step sees only the current video -> a systematic,
+            # history-length-growing log-prob bias (recompute consistency).
+            replay_frame_st_id = self._replay_history_cache(fi, batch_size)
+            if replay_frame_st_id != frame_st_id:
+                raise RuntimeError(
+                    "recompute history replay reached frame_st_id "
+                    f"{replay_frame_st_id} but forward_inputs stored "
+                    f"{frame_st_id}; KV-replay history pack is inconsistent."
+                )
             self._commit_video_cache(fi.video_latents, batch_size, frame_st_id)
 
         server.action_scheduler.set_timesteps(num_action_steps)
@@ -1090,20 +1284,8 @@ class LingbotVALiberoBackend:
         chains_pre = fi.action_chains[:, 0]
         chains_next = fi.action_chains[:, 1]
 
-        # The single action forward uses one scalar timestep, so all samples in
-        # the micro-batch must share the scored step. This holds for
-        # micro_batch_size == 1 (the RL config). # VALIDATE: heterogeneous
-        # micro-batches need per-sample action timesteps in _prepare_batch_input
-        # (as OpenPI's action expert supports); raise clearly until then.
-        unique_steps = torch.unique(denoise_inds)
-        if unique_steps.numel() != 1:
-            raise NotImplementedError(
-                "recompute_logprob got mixed denoise_inds "
-                f"{unique_steps.tolist()} in one micro-batch. Set "
-                "actor.micro_batch_size=1, or implement per-sample action "
-                "timesteps in _prepare_batch_input."
-            )
-        timestep = float(action_timesteps[int(unique_steps.item())])
+        # Group is homogeneous in denoise_ind, so one scalar timestep applies.
+        timestep = float(action_timesteps[int(denoise_inds[0].item())])
 
         # Gradients on: this is the only forward the GRPO update backprops.
         v_t, action_cond = self._action_velocity(
@@ -1118,8 +1300,7 @@ class LingbotVALiberoBackend:
             entropy = reduce_chain_logprob(gaussian_entropy(std))
         else:
             entropy = torch.zeros(batch_size, device=server.device)
-        values = torch.zeros(batch_size, device=server.device)  # GRPO: critic-free
-        return {"logprobs": logprobs, "entropy": entropy, "values": values}
+        return {"logprobs": logprobs, "entropy": entropy}
 
     def close(self) -> None:
         if getattr(self, "_server", None) is None:

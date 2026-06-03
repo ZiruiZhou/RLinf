@@ -69,6 +69,11 @@ _RL_FI_FIELDS = (
     "num_action_steps",
     "exec_steps",
     "action_dim",
+    # Cross-chunk KV-cache replay (recompute consistency under frame_st_id>0).
+    "history_latents",
+    "history_actions",
+    "history_lat_frames",
+    "history_len",
 )
 
 
@@ -117,6 +122,11 @@ class RLForwardInputs:
     exec_steps: torch.Tensor
     action_dim: torch.Tensor
     negative_prompt_embeds: torch.Tensor | None = None
+    # Cross-chunk KV-cache replay (optional; absent -> recompute skips replay).
+    history_latents: torch.Tensor | None = None
+    history_actions: torch.Tensor | None = None
+    history_lat_frames: torch.Tensor | None = None
+    history_len: torch.Tensor | None = None
 
     @classmethod
     def build(
@@ -133,6 +143,10 @@ class RLForwardInputs:
         num_action_steps: int,
         exec_steps: int,
         action_dim: int,
+        history_latents: torch.Tensor | None = None,
+        history_actions: torch.Tensor | None = None,
+        history_lat_frames: torch.Tensor | None = None,
+        history_len: torch.Tensor | None = None,
     ) -> "RLForwardInputs":
         """Construct from tensors + per-call scalars (scalars -> ``[B]`` tensors)."""
         batch = action_chains.shape[0]
@@ -152,6 +166,10 @@ class RLForwardInputs:
             num_action_steps=_full(int(num_action_steps), torch.long),
             exec_steps=_full(int(exec_steps), torch.long),
             action_dim=_full(int(action_dim), torch.long),
+            history_latents=history_latents,
+            history_actions=history_actions,
+            history_lat_frames=history_lat_frames,
+            history_len=history_len,
         )
 
     # Per-call scalars are batch-constant; read the first element.
@@ -181,6 +199,18 @@ class RLForwardInputs:
 
         return RLForwardInputs(**{k: _m(getattr(self, k)) for k in _RL_FI_FIELDS})
 
+    def index_select(self, idx: torch.Tensor) -> "RLForwardInputs":
+        """Return a sub-batch view selecting rows ``idx`` along dim 0.
+
+        Used by the recompute to process a homogeneous group (same scored step +
+        history structure) as one batched forward.
+        """
+
+        def _m(t):
+            return t[idx] if torch.is_tensor(t) else t
+
+        return RLForwardInputs(**{k: _m(getattr(self, k)) for k in _RL_FI_FIELDS})
+
     def as_dict(self) -> dict[str, Any]:
         return {k: getattr(self, k) for k in _RL_FI_FIELDS}
 
@@ -198,6 +228,10 @@ class RLForwardInputs:
             num_action_steps=d["num_action_steps"],
             exec_steps=d["exec_steps"],
             action_dim=d["action_dim"],
+            history_latents=d.get("history_latents"),
+            history_actions=d.get("history_actions"),
+            history_lat_frames=d.get("history_lat_frames"),
+            history_len=d.get("history_len"),
         )
 
 

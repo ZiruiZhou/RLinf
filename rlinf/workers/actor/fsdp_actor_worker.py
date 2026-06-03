@@ -1319,9 +1319,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
         )
-        g = torch.Generator()
-        g.manual_seed(self.cfg.actor.seed + self._rank)
-        shuffle_id = torch.randperm(rollout_size, generator=g)
+        # LingBot-VA recomputes a denoising step conditioned on a replayed KV
+        # cache; samples from the SAME rollout chunk share the scored step and
+        # history, so the recompute batches them into one forward. A random
+        # shuffle scatters chunk-mates across micro-batches and kills that
+        # batching, so keep the chunk-contiguous order (the recompute is still
+        # exact). Other models shuffle for SGD decorrelation as usual.
+        if str(self.cfg.actor.model.model_type) == "lingbotva":
+            shuffle_id = torch.arange(rollout_size)
+        else:
+            g = torch.Generator()
+            g.manual_seed(self.cfg.actor.seed + self._rank)
+            shuffle_id = torch.randperm(rollout_size, generator=g)
 
         with torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(

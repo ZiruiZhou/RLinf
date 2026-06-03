@@ -184,7 +184,13 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 1
+  # The recompute groups a micro-batch by (frame_st_id, denoise_ind) and runs
+  # each group as one batched forward, so micro_batch_size > 1 is supported and
+  # recommended: set it to roughly one rollout chunk's env count so each
+  # micro-batch is a single batched recompute (amortizes the FSDP all-gather and
+  # the KV-cache replay). The training shuffle is disabled for lingbotva to keep
+  # chunk-mates contiguous.
+  micro_batch_size: 4
   # global_batch_size / (micro_batch_size * world_size) = grad_accum.
   global_batch_size: 8
   seed: 1234
@@ -213,6 +219,14 @@ actor:
       # KV-cache replay flag the rollout needs for non-zero SR must live HERE.
       # Harmless on the actor: the recompute path doesn't touch the recorder.
       enable_kv_cache_replay: True
+      # Recompute-under-replay: the rollout stores its replayed per-chunk KV
+      # cache (encoded latents + actions) so the actor recompute reproduces the
+      # exact conditioning the scored action step attended to (ratio~1). These
+      # cap the fixed-size stored history block; must cover the episode:
+      # max_history >= ceil(max_episode_steps / num_action_chunks),
+      # max_frames  >= cumulative latent frames over that many chunks.
+      kv_replay_max_history: 24
+      kv_replay_max_frames: 80
       # RL actor: rl_mode builds the backend and exposes its transformer as an
       # FSDP-wrapped child so the GRPO update recomputes log-probs with
       # gradients. (rl_mode supersedes training_mode; do not set both.)

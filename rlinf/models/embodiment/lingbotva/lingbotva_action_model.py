@@ -355,6 +355,10 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
             num_action_steps=rl_out["num_action_steps"],
             exec_steps=exec_steps,
             action_dim=self.action_dim,
+            history_latents=rl_out.get("history_latents"),
+            history_actions=rl_out.get("history_actions"),
+            history_lat_frames=rl_out.get("history_lat_frames"),
+            history_len=rl_out.get("history_len"),
         )
 
         # One diffusion-step log-prob per sample, broadcast across the executed
