@@ -108,15 +108,23 @@ def _evaluate(
     task_stats: dict[int, dict[str, int]] = {}
     cur_episode_task_ids = list(env.task_ids.copy())
 
-    target_total_episodes = num_episodes
-    max_steps_safety = num_episodes * 260
+    # Count exactly ONE episode per env object: the first time each env reaches
+    # a terminal state. Rationale — the action model keeps inter-chunk KV-cache
+    # state that ``reset_episode`` does not fully clear, so any 2nd+ episode an
+    # env runs after an auto-reset is unreliable. The previous "stop once the
+    # cumulative episode count hits num_envs" logic let fast (successful) envs
+    # auto-reset and double-count short follow-up episodes while slow (full
+    # 240-step) envs were never counted, biasing the success rate. Here we mark
+    # each env counted on its first done and run until every env has finished
+    # once, so each env contributes its single clean (task, init_state) episode.
+    num_envs = len(cur_episode_task_ids)
+    counted = [False] * num_envs
+
+    max_steps_safety = max(num_episodes, num_envs) * 260
 
     chunk_idx = 0
     enable_kv_replay = getattr(model, "enable_kv_cache_replay", False)
-    while (
-        total_episodes_done < target_total_episodes
-        and total_steps < max_steps_safety
-    ):
+    while not all(counted) and total_steps < max_steps_safety:
         t0 = time.time()
         action_tensor, _ = model.predict_action_batch(obs, mode="eval")
         infer_sec = time.time() - t0
@@ -136,21 +144,31 @@ def _evaluate(
         successes_this_chunk = chunk_terminations.any(dim=1)
         for env_idx in range(past_dones.shape[0]):
             if past_dones[env_idx].item():
-                task_id = int(cur_episode_task_ids[env_idx])
-                stats = task_stats.setdefault(
-                    task_id, {"success": 0, "total": 0}
-                )
-                stats["total"] += 1
-                if successes_this_chunk[env_idx].item():
-                    stats["success"] += 1
-                    successes += 1
-                else:
-                    failures += 1
-                total_episodes_done += 1
+                # Only the first completion of each env is a valid sample.
+                if not counted[env_idx]:
+                    counted[env_idx] = True
+                    task_id = int(cur_episode_task_ids[env_idx])
+                    stats = task_stats.setdefault(
+                        task_id, {"success": 0, "total": 0}
+                    )
+                    stats["total"] += 1
+                    if successes_this_chunk[env_idx].item():
+                        stats["success"] += 1
+                        successes += 1
+                    else:
+                        failures += 1
+                    total_episodes_done += 1
                 cur_episode_task_ids[env_idx] = int(env.task_ids[env_idx])
                 if hasattr(model, "reset_episode"):
                     model.reset_episode(env_idx)
-            elif enable_kv_replay:
+            elif enable_kv_replay and not counted[env_idx]:
+                # Only grow KV-cache history for envs still on their first (the
+                # only counted) episode. Once an env is counted it keeps
+                # auto-resetting into throwaway follow-up episodes until the
+                # slowest env finishes; recording those would accumulate
+                # unbounded per-env replay history and OOM the VAE encode. We
+                # skip recording for counted envs so memory stays bounded by a
+                # single episode's history.
                 state = model._episode_states.get(env_idx)
                 if state is not None and state.prev_model_action is not None:
                     model.record_chunk_observations(
@@ -217,7 +235,8 @@ def main(cfg: DictConfig) -> None:
     metrics = _evaluate(model, env, num_episodes=num_episodes)
     metrics["elapsed_sec"] = time.time() - t0
     metrics["num_envs"] = num_envs
-    metrics["num_episodes"] = num_episodes
+    # One valid episode per env (see _evaluate); report the true counted total.
+    metrics["num_episodes"] = metrics["successes"] + metrics["failures"]
 
     out_dir = Path(cfg.runner.logger.log_path)
     out_dir.mkdir(parents=True, exist_ok=True)
