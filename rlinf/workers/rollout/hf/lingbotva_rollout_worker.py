@@ -12,52 +12,92 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stateful rollout worker for LingBot-VA GRPO — SCAFFOLDING.
+"""Stateful KV-replay rollout worker for LingBot-VA GRPO.
 
-The generic ``MultiStepRolloutWorker`` is stateless across chunk steps: it
-keeps only the last step's wrapped obs and drops the per-step raw obs that
-LingBot-VA needs to maintain its cross-chunk KV-cache. That is exactly why
-PR #1220 shipped a dedicated ``eval_lingbotva.py`` driver for evaluation.
+LingBot-VA conditions each chunk on the prior chunks' observed key frames via a
+transformer KV cache, which is what gives it non-zero success rate (without
+replay SR collapses to ~0%). The generic ``MultiStepRolloutWorker`` is
+stateless across chunks and only forwards the chunk-boundary obs, so this
+subclass:
 
-For RL the same gap means a vanilla rollout collapses LingBot-VA's success
-rate to ~0% (no KV-cache replay), so the policy would never see reward and
-never learn. This worker is the RL-path equivalent of ``eval_lingbotva.py``:
-it maintains per-environment ``LingbotVAEpisodeState``, records chunk
-observations for KV-cache replay, and resets episode state on done — while
-still emitting ``RolloutResult``s onto the channels like the base worker.
+  * reads the per-step key-frame images the env worker now forwards (sibling
+    keys ``chunk_keyframe_main`` / ``chunk_keyframe_wrist`` inside the obs, plus
+    ``chunk_dones``), and
+  * before each prediction, feeds them to the policy's
+    ``record_chunk_wrapped_observations`` (or resets the episode on done),
 
-STATUS: not implemented. See
-``rlinf/models/embodiment/lingbotva/RL_DESIGN.md`` §4B. The substantive logic
-(per-step obs capture + KV replay on the channel-based path) requires the
-lingbot-va repo and a checkpoint to validate against gate #2 (RL rollout SR ≈
-eval SR before any update).
+so the model's per-env KV-replay state is maintained across the distributed
+rollout — the channel-based equivalent of what ``eval_lingbotva.py`` does
+in-process. See RL_DESIGN.md §4B.
 """
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
 from omegaconf import DictConfig
 
+from rlinf.scheduler import Channel
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 class LingbotVARolloutWorker(MultiStepRolloutWorker):
-    """Rollout worker for LingBot-VA GRPO.
-
-    LingBot-VA's RL rollout (``_rl_predict_action_batch`` ->
-    ``backend.infer_batch_with_logprob``) runs the first-chunk
-    (``frame_st_id == 0``) path: each ``predict_action_batch`` call is
-    self-contained and returns real ``prev_logprobs`` + ``forward_inputs``. So
-    the generic per-chunk loop of :class:`MultiStepRolloutWorker` already drives
-    it correctly and we inherit it unchanged.
-
-    Phase 2 (cross-chunk KV-cache replay for higher rollout SR) will override
-    the per-chunk generation to capture per-step raw obs and feed
-    ``model.record_chunk_observations`` / ``model.reset_episode``, mirroring
-    ``eval_lingbotva.py``. Until then the per-env state below is unused but kept
-    as the hook point. See RL_DESIGN.md §4B.
-    """
+    """KV-replay rollout worker for LingBot-VA (GRPO)."""
 
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
-        # Reserved for Phase 2 stateful KV-replay (per global env index).
-        self._episode_states: dict = {}
+
+    async def recv_env_output(
+        self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
+    ) -> dict[str, Any]:
+        """Receive the env output, then update the policy's KV-replay state.
+
+        The env worker rides the chunk's per-step key-frame images + dones in
+        the obs dict. We record them into the (per-env) episode history of the
+        policy before the next prediction, and reset episodes that just ended.
+        The extra keys are stripped so the downstream predict path is unchanged.
+        """
+        env_output = await super().recv_env_output(input_channel, mode)
+        obs = env_output.get("obs") if isinstance(env_output, dict) else None
+        if not isinstance(obs, dict) or "chunk_keyframe_main" not in obs:
+            return env_output
+
+        kf_main = obs.pop("chunk_keyframe_main")  # [B, T, H, W, 3]
+        kf_wrist = obs.pop("chunk_keyframe_wrist")
+        dones = obs.pop("chunk_dones", None)  # [B] bool
+        model = self.hf_model
+        if not hasattr(model, "record_chunk_wrapped_observations"):
+            return env_output
+
+        batch_size = kf_main.shape[0]
+        for env_idx in range(batch_size):
+            # chunk_dones may be [B] or [B, chunk_steps]; an env "finished" this
+            # chunk if it terminated/truncated at any step.
+            done = bool(dones[env_idx].any()) if dones is not None else False
+            if done:
+                # Episode just ended (env auto-reset); drop its history so the
+                # next prediction starts a fresh first chunk.
+                model.reset_episode(env_idx)
+                continue
+            state = model._get_state(env_idx)
+            prev_action = getattr(state, "prev_model_action", None)
+            if prev_action is None:
+                continue  # no chunk produced yet (first step)
+            model.record_chunk_wrapped_observations(
+                env_idx,
+                kf_main[env_idx],
+                kf_wrist[env_idx],
+                prev_action,
+            )
+        # Debug-level trace of the per-env replay state (history should grow
+        # 1..N within an episode and reset to 0 at the boundary).
+        try:
+            st0 = model._get_state(0)
+            self.log_debug(
+                f"[KV-replay] env0 history_len={len(st0.kv_cache_history)} "
+                f"kf_shape={tuple(kf_main.shape)} prompt={st0.prompt is not None} "
+                f"replay_on={model.enable_kv_cache_replay}"
+            )
+        except Exception:
+            pass
+        return env_output

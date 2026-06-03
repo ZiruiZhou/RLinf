@@ -167,8 +167,10 @@ rollout:
       action_per_frame: 4
       transformer_state_dict_path: ${oc.env:LINGBOT_VA_TRANSFORMER_STATE_DICT_PATH,null}
       save_root: ./runtime/lingbotva_rl_rollout
-      # Cross-chunk KV-cache replay must stay ON for non-zero SR (see eval).
-      # The stateful rollout worker (LingbotVARolloutWorker) preserves it.
+      # NOTE: the rollout policy is actually built from `actor.model` (see
+      # huggingface_worker.init_worker), so this whole `rollout.model.lingbotva`
+      # block is documentation only — the effective replay flag lives in
+      # `actor.model.lingbotva.enable_kv_cache_replay`. Kept here for clarity.
       enable_kv_cache_replay: True
       # RL rollout: run the action chain as a stochastic SDE and return
       # per-step Gaussian log-probs.
@@ -206,6 +208,11 @@ actor:
       action_per_frame: 4
       transformer_state_dict_path: ${oc.env:LINGBOT_VA_TRANSFORMER_STATE_DICT_PATH,null}
       save_root: ./runtime/lingbotva_rl_actor
+      # The rollout worker builds its policy from `actor.model` (huggingface_worker
+      # only copies precision/model_path from `rollout.model`), so the cross-chunk
+      # KV-cache replay flag the rollout needs for non-zero SR must live HERE.
+      # Harmless on the actor: the recompute path doesn't touch the recorder.
+      enable_kv_cache_replay: True
       # RL actor: rl_mode builds the backend and exposes its transformer as an
       # FSDP-wrapped child so the GRPO update recomputes log-probs with
       # gradients. (rl_mode supersedes training_mode; do not set both.)

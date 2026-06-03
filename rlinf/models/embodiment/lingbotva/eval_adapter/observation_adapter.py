@@ -100,3 +100,31 @@ class LingbotVALiberoObservationAdapter:
             ),
             "task": prompt,
         }
+
+    @staticmethod
+    def _flip_wrapped_image(img: Any) -> np.ndarray:
+        """Apply the same horizontal flip as ``format_observation`` to one
+        already-wrapped (180-rotated) image of shape ``[H, W, 3]``."""
+        if isinstance(img, torch.Tensor):
+            arr = img.detach().cpu().numpy()
+        else:
+            arr = np.asarray(img)
+        return np.ascontiguousarray(arr[:, ::-1, :])
+
+    @classmethod
+    def format_single_wrapped(
+        cls, main_img: Any, wrist_img: Any, prompt: str
+    ) -> dict[str, Any]:
+        """Format one single-env WRAPPED key-frame (main/wrist ``[H, W, 3]``).
+
+        Used by the distributed KV-replay path: the env worker forwards the
+        per-step wrapped images (``main_images``/``wrist_images``), which carry
+        the same orientation ``format_observation`` consumes, so we apply the
+        same horizontal flip. Equivalent to ``format_raw_step_observation`` but
+        for the wrapped (rather than raw libero) image layout.
+        """
+        return {
+            "observation.images.agentview_rgb": cls._flip_wrapped_image(main_img),
+            "observation.images.eye_in_hand_rgb": cls._flip_wrapped_image(wrist_img),
+            "task": prompt,
+        }

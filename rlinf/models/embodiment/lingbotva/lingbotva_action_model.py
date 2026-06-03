@@ -703,15 +703,78 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         # The LingBot-VA clients sample key frames every ``action_per_frame // 4``
         # env steps (so they record 4 key frames per video frame predicted by
         # the model). For Libero that period is 1 (every step), for RoboTwin
-        # 4. Fall back to 1 if the integer division would round to 0.
-        period = max(1, self.action_per_frame // 4)
+        # 4. ``kv_replay_period`` overrides it — a large value keeps only the
+        # last (chunk-boundary) frame, which the distributed rollout already
+        # has, avoiding any per-step obs routing if SR holds.
+        period = int(
+            getattr(
+                self.config.lingbotva,
+                "kv_replay_period",
+                max(1, self.action_per_frame // 4),
+            )
+        )
+        period = max(1, period)
+        last_idx = len(chunk_obs_list) - 1
         key_frames: list[dict[str, Any]] = []
         for step_idx, raw_obs in enumerate(chunk_obs_list):
-            if (step_idx + 1) % period != 0:
+            # Always keep the chunk-boundary (last) frame; otherwise every
+            # ``period``-th. A large period -> boundary-only.
+            if (step_idx + 1) % period != 0 and step_idx != last_idx:
                 continue
             key_frames.append(
                 LingbotVALiberoObservationAdapter.format_raw_step_observation(
                     raw_obs=raw_obs,
+                    prompt=state.prompt,
+                )
+            )
+        if not key_frames:
+            return
+        state.kv_cache_history.append(
+            (key_frames, np.asarray(prev_model_action, dtype=np.float32).copy())
+        )
+
+    def record_chunk_wrapped_observations(
+        self,
+        env_idx: int,
+        main_seq: Any,
+        wrist_seq: Any,
+        prev_model_action: np.ndarray,
+    ) -> None:
+        """KV-replay record from WRAPPED per-step obs (distributed path).
+
+        ``main_seq`` / ``wrist_seq`` are the chunk's per-step wrapped images for
+        ONE env, shape ``[num_steps, H, W, 3]`` (forwarded by the env worker).
+        Subsamples to key frames (always keeping the last) and appends to the
+        episode's KV-cache history — the wrapped-obs analogue of
+        :meth:`record_chunk_observations` (which takes raw libero obs).
+        """
+        if not self.enable_kv_cache_replay:
+            return
+        state = self._get_state(env_idx)
+        if state.prompt is None:
+            return
+        num_steps = len(main_seq)
+        if num_steps == 0:
+            return
+        period = max(
+            1,
+            int(
+                getattr(
+                    self.config.lingbotva,
+                    "kv_replay_period",
+                    max(1, self.action_per_frame // 4),
+                )
+            ),
+        )
+        last_idx = num_steps - 1
+        key_frames: list[dict[str, Any]] = []
+        for step_idx in range(num_steps):
+            if (step_idx + 1) % period != 0 and step_idx != last_idx:
+                continue
+            key_frames.append(
+                LingbotVALiberoObservationAdapter.format_single_wrapped(
+                    main_img=main_seq[step_idx],
+                    wrist_img=wrist_seq[step_idx],
                     prompt=state.prompt,
                 )
             )

@@ -59,7 +59,17 @@ class EnvOutput:
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
 
+    # Optional per-chunk per-step key-frame images for stateful policies that
+    # replay observed frames into a KV cache (LingBot-VA). Shape
+    # [B, num_keyframes, H, W, 3]. None for all other models.
+    chunk_keyframe_main: Optional[torch.Tensor] = None
+    chunk_keyframe_wrist: Optional[torch.Tensor] = None
+
     def __post_init__(self):
+        if self.chunk_keyframe_main is not None:
+            self.chunk_keyframe_main = self.chunk_keyframe_main.cpu()
+        if self.chunk_keyframe_wrist is not None:
+            self.chunk_keyframe_wrist = self.chunk_keyframe_wrist.cpu()
         self.obs = put_tensor_device(self.obs, "cpu")
         self.final_obs = (
             put_tensor_device(self.final_obs, "cpu")

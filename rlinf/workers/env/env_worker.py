@@ -411,6 +411,12 @@ class EnvWorker(Worker):
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
+        # Stateful policies (LingBot-VA) replay observed key frames into a KV
+        # cache, so forward the per-step images of this chunk to the rollout.
+        # No-op for every other model.
+        chunk_keyframe_main, chunk_keyframe_wrist = self._build_chunk_keyframes(
+            obs_list
+        )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
@@ -461,8 +467,30 @@ class EnvWorker(Worker):
             truncations=chunk_truncations,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
+            chunk_keyframe_main=chunk_keyframe_main,
+            chunk_keyframe_wrist=chunk_keyframe_wrist,
         )
         return env_output, env_info
+
+    def _build_chunk_keyframes(self, obs_list):
+        """Stack this chunk's per-step wrapped images for stateful KV-replay.
+
+        Returns ``(main, wrist)`` each ``[B, num_steps, H, W, 3]`` for
+        LingBot-VA, else ``(None, None)``. The model subsamples to its key
+        frames; we forward all per-step frames (the chunk is short).
+        """
+        if str(self.cfg.actor.model.model_type) != "lingbotva":
+            return None, None
+        if not isinstance(obs_list, (list, tuple)) or not obs_list:
+            return None, None
+        try:
+            main = torch.stack(
+                [o["main_images"] for o in obs_list], dim=1
+            )  # [B, T, H, W, 3]
+            wrist = torch.stack([o["wrist_images"] for o in obs_list], dim=1)
+        except (KeyError, TypeError):
+            return None, None
+        return main, wrist
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
@@ -727,6 +755,23 @@ class EnvWorker(Worker):
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 
+    def _make_obs_payload(
+        self, env_output: "EnvOutput", env_batch: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build the {obs, final_obs} send payload, folding LingBot-VA's
+        per-chunk key-frame images + dones into obs as sibling keys (they ride
+        through split_dict / _merge_obs_batches). No-op for other models or the
+        bootstrap step (keyframes are None)."""
+        obs = env_batch["obs"]
+        if env_output.chunk_keyframe_main is not None:
+            obs = {
+                **obs,
+                "chunk_keyframe_main": env_output.chunk_keyframe_main,
+                "chunk_keyframe_wrist": env_output.chunk_keyframe_wrist,
+                "chunk_dones": env_output.dones,
+            }
+        return {"obs": obs, "final_obs": env_batch["final_obs"]}
+
     def send_env_batch(
         self,
         rollout_channel: Channel,
@@ -956,10 +1001,7 @@ class EnvWorker(Worker):
             env_batch = env_output.to_dict()
             self.send_env_batch(
                 rollout_channel,
-                {
-                    "obs": env_batch["obs"],
-                    "final_obs": env_batch["final_obs"],
-                },
+                self._make_obs_payload(env_output, env_batch),
             )
 
     def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
@@ -1106,10 +1148,7 @@ class EnvWorker(Worker):
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
                         rollout_channel,
-                        {
-                            "obs": env_batch["obs"],
-                            "final_obs": env_batch["final_obs"],
-                        },
+                        self._make_obs_payload(env_output, env_batch),
                     )
                     if self.collect_transitions:
                         next_obs = (
