@@ -99,7 +99,11 @@ class LiberoEnv(gym.Env):
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
-        self.start_idx = 0
+        # Offset into the ordered reset-state list for the first window. Lets an
+        # eval shard cover a disjoint block of init states (e.g. inits 4-7 of a
+        # task) so multiple single-episode-per-env processes can sample different
+        # initial conditions without overlap. Default 0 = start at the front.
+        self.start_idx = int(cfg.get("eval_reset_start_idx", 0))
 
         self.task_suite: Benchmark = get_benchmark_overridden(cfg.task_suite_name)()
 
