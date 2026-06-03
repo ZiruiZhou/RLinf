@@ -39,6 +39,10 @@ from rlinf.models.embodiment.lingbotva.eval_adapter.native_backend import (
 from rlinf.models.embodiment.lingbotva.eval_adapter.observation_adapter import (
     LingbotVALiberoObservationAdapter,
 )
+from rlinf.models.embodiment.lingbotva.rl_engine import (
+    RLForwardInputs,
+    broadcast_logprob_to_actions,
+)
 
 
 class LingbotVAActionModel(nn.Module, BasePolicy):
@@ -92,6 +96,13 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         self.training_mode = bool(
             getattr(cfg.lingbotva, "training_mode", False)
         )
+        # RL (GRPO) mode. When set, the action-denoising chain is sampled as a
+        # stochastic SDE so each step has a tractable diagonal-Gaussian
+        # log-prob (see rl_utils / rl_engine and RL_DESIGN.md). ``_init_rl``
+        # builds the backend and exposes its transformer as an FSDP-wrapped
+        # child whose log-probs ``default_forward`` recomputes with gradients.
+        self.rl_mode = bool(getattr(cfg.lingbotva, "rl_mode", False))
+        self.noise_method = str(getattr(cfg.lingbotva, "noise_method", "flow_sde"))
 
         self._backend: LingbotVALiberoBackend | None = None
         self._episode_states: dict[int, LingbotVAEpisodeState] = {}
@@ -99,6 +110,36 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
 
         if self.training_mode:
             self._load_transformer_for_training()
+        elif self.rl_mode:
+            self._init_rl()
+
+    def _init_rl(self) -> None:
+        """Build the RL backend and expose its transformer for FSDP / GRPO.
+
+        Both the rollout copy (sampling) and the actor copy (recompute) use the
+        same in-process backend. We register the backend's transformer as
+        ``self.transformer`` so FSDP wraps exactly those weights and the GRPO
+        optimizer + weight-sync operate on the same module the diffusion loops
+        drive.
+
+        # VALIDATE: requires an in-place FSDP wrap (fsdp2 ``fully_shard``) so
+        # ``self.transformer`` and ``backend._server.transformer`` stay the same
+        # object after sharding. The RL config pins ``strategy: fsdp2``.
+        """
+        self._backend = LingbotVALiberoBackend(self.config, self.torch_dtype)
+        self.transformer = self._backend._server.transformer
+        # VA_Server's load leaves freshly-initialised params (e.g.
+        # scale_shift_table, the action head) in fp32 while the rest are bf16.
+        # FSDP2 fully_shard requires a uniform original param dtype, so force
+        # the whole transformer to bf16 (same as the SFT path does).
+        self.transformer.to(dtype=self.torch_dtype)
+        # VA_Server builds the transformer with eval_mode=True, which freezes
+        # every parameter (requires_grad=False) for inference. The RL ACTOR
+        # trains it, so unfreeze; otherwise the FSDP optimizer gets an empty
+        # parameter list. (Harmless for the rollout copy, which never steps.)
+        for param in self.transformer.parameters():
+            param.requires_grad_(True)
+        self.transformer.train()
 
     # ------------------------------------------------------------------
     # Forward dispatch
@@ -114,11 +155,221 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         )
 
     def default_forward(self, **kwargs):
+        # In RL mode the actor calls default_forward to RECOMPUTE the log-prob
+        # (and entropy) of the stored action-denoising step with gradients, for
+        # the GRPO ratio. See get_log_prob_value for the contract.
+        if self.rl_mode:
+            return self.get_log_prob_value(**kwargs)
         del kwargs
         raise NotImplementedError(
             "LingBot-VA default_forward is not supported. Use predict_action_batch "
-            "for eval or sft_forward for training."
+            "for eval, sft_forward for training, or set lingbotva.rl_mode=True "
+            "for GRPO recompute."
         )
+
+    # ------------------------------------------------------------------
+    # RL (GRPO) path  —  Phase-1 DRAFT (see RL_DESIGN.md)
+    # ------------------------------------------------------------------
+    # The math (flow-SDE mean/std, Gaussian log-prob/entropy) lives in
+    # rl_utils + rl_engine and is unit-tested. The two methods below delegate
+    # to the backend (native_backend.infer_batch_with_logprob /
+    # recompute_logprob), which run the wan_va-coupled diffusion loops. This is
+    # an UNVALIDATED draft: it cannot run without the lingbot-va repo + a
+    # checkpoint, and the `# VALIDATE:` notes (FSDP transformer sharing, logprob
+    # shape vs. the actor worker, KV-replay) must be confirmed first. Gate #1
+    # (rollout prev_logprobs == recompute logprobs at the behaviour weights)
+    # is the acceptance test.
+
+    def get_log_prob_value(
+        self,
+        forward_inputs: dict | None = None,
+        compute_logprobs: bool = True,
+        compute_entropy: bool = False,
+        compute_values: bool = False,
+        **kwargs,
+    ) -> dict:
+        """Recompute action log-prob/entropy/value for the stored denoise step.
+
+        Mirrors ``lingbotvla``'s ``get_log_prob_value`` / OpenPI's
+        ``get_log_prob_value``. ``forward_inputs`` is exactly what
+        :meth:`predict_action_batch` stored in RL mode and must contain:
+
+          - ``action_chains``: the latent action trajectory of the denoising
+            chain, ``[B, num_steps + 1, action_dim, frame_chunk, action_per_frame]``.
+          - ``denoise_inds``: ``[B, K]`` indices of the denoise step(s) whose
+            transition log-prob is scored (K=1 unless joint_logprob).
+          - the conditioning needed to reproduce the action-transformer
+            velocity at ``action_chains[:, denoise_ind]`` WITHOUT re-running the
+            video diffusion: the post-video conditioning (init/KV state, prompt
+            embeds, grid ids, frame_st_id, action_mask). Reconstructing this
+            faithfully is the #1 correctness gate (old_logprob == new_logprob).
+
+        Returns ``{"logprobs", "entropy", "values"}`` with gradients, shaped to
+        ``algorithm.logprob_type`` (action_level: ``[B, exec_steps, action_dim]``).
+        """
+        if forward_inputs is None:
+            forward_inputs = kwargs.get("forward_inputs")
+        if forward_inputs is None:
+            raise ValueError("get_log_prob_value requires forward_inputs.")
+        fi = (
+            forward_inputs
+            if isinstance(forward_inputs, RLForwardInputs)
+            else RLForwardInputs.from_dict(forward_inputs)
+        )
+        backend = self._ensure_backend()
+        out = backend.recompute_logprob(
+            fi, compute_entropy=compute_entropy, compute_values=compute_values
+        )
+        # Broadcast the per-sample denoising-step log-prob to the executed-action
+        # shape the GRPO loss expects (logprob_type: action_level). exec_steps is
+        # stored at sampling time so rollout and recompute shapes match exactly.
+        # VALIDATE: confirm this matches the actor worker's logprob reshaping.
+        exec_steps = fi.scalar_exec_steps
+        action_dim = fi.scalar_action_dim
+        # The GRPO loss requires float32 logprobs for numerical stability, and
+        # they must match the rollout's prev_logprobs (also cast to float32).
+        logprobs = broadcast_logprob_to_actions(
+            out["logprobs"].float(), exec_steps, action_dim
+        )
+        entropy = broadcast_logprob_to_actions(
+            out["entropy"].float(), exec_steps, action_dim
+        )
+        return {"logprobs": logprobs, "entropy": entropy, "values": out["values"].float()}
+
+    def _rl_predict_action_batch(
+        self, env_obs: dict[str, Any], mode: str = "train", **kwargs: Any
+    ):
+        """Rollout forward for GRPO: stochastic action chain + log-probs.
+
+        Returns ``(actions, result)`` exactly like the eval path, but
+        ``result`` carries REAL ``prev_logprobs`` (the per-step Gaussian
+        log-prob of the sampled action-denoising step) instead of zeros, and
+        ``result["forward_inputs"]`` stores the data
+        :meth:`get_log_prob_value` needs to reproduce that step:
+        ``action_chains``, ``denoise_inds``, and the post-video conditioning.
+        ``prev_values`` stays zeros under GRPO (critic-free).
+
+        Implementation plan (Phase 1/2):
+          1. Run the deterministic video-latent diffusion (as eval does) to
+             build the action-transformer conditioning + KV cache.
+          2. Run the action-latent loop, but for one randomly chosen denoise
+             step replace the deterministic update with
+             ``rl_utils.flow_sde_step`` + a Gaussian sample, recording the
+             latent chain and the step's mean/std.
+          3. Log-prob via ``rl_utils.gaussian_logprob``; reduce per
+             ``algorithm.logprob_type``; slice to the executable env actions.
+        """
+        del mode
+        states_tensor = env_obs.get("states")
+        if states_tensor is None:
+            raise ValueError("LingBot-VA RL rollout requires batched states.")
+        batch_size = states_tensor.shape[0]
+        noise_level = float(
+            kwargs.get(
+                "noise_level", getattr(self.config.lingbotva, "rl_noise_level", 1.0)
+            )
+        )
+        backend = self._ensure_backend()
+
+        # Build per-env episode state, prompts, and the KV-replay histories —
+        # mirrors the eval predict_action_batch. With replay enabled the model
+        # conditions each chunk on the prior chunks' observed key frames, which
+        # is what restores non-zero rollout SR; without it every chunk is a
+        # fresh first chunk (~0% SR).
+        prompts: list[str] = []
+        obs_batch: list[dict[str, Any]] = []
+        kv_cache_histories: list[list[tuple[list[dict[str, Any]], np.ndarray]]] = []
+        first_chunk_flags: list[bool] = []
+        for env_idx in range(batch_size):
+            prompt = self._get_prompt(env_obs, env_idx)
+            state = self._get_state(env_idx)
+            if state.prompt != prompt:
+                state.reset(prompt)
+            obs = LingbotVALiberoObservationAdapter.format_observation(
+                env_obs, env_idx, prompt
+            )
+            if state.first_obs is None:
+                state.first_obs = obs
+            prompts.append(prompt)
+            obs_batch.append(
+                state.first_obs if self.enable_kv_cache_replay else obs
+            )
+            kv_cache_histories.append(list(state.kv_cache_history))
+            first_chunk_flags.append(state.first_chunk)
+
+        replay_groups_match = all(
+            len(h) == len(kv_cache_histories[0]) for h in kv_cache_histories
+        )
+        use_replay = (
+            self.enable_kv_cache_replay
+            and replay_groups_match
+            and any(len(h) > 0 for h in kv_cache_histories)
+        )
+        rl_out = backend.infer_batch_with_logprob(
+            obs_batch,
+            prompts,
+            noise_level=noise_level,
+            kv_cache_histories=kv_cache_histories if use_replay else None,
+        )
+        raw_actions = rl_out["actions"]
+        logprob_b = rl_out["logprob"]  # [B], the chosen denoise-step log-prob
+
+        # Assemble the executable action tensor. With KV replay we follow the
+        # LingBot-VA client semantics: drop the leading placeholder frame only
+        # on the very first inference per episode; otherwise keep all frames.
+        # exec_steps_per_chunk (= num_action_chunks) caps the length so chunks
+        # stay a uniform size across the rollout (12 for Libero).
+        chunks: list[torch.Tensor] = []
+        for env_idx, raw_action in enumerate(raw_actions):
+            state = self._get_state(env_idx)
+            is_first = (
+                state.first_chunk if self.enable_kv_cache_replay else True
+            )
+            env_actions = self._select_executable_actions(
+                raw_action, first_chunk=is_first
+            )
+            limit = min(self.exec_steps_per_chunk, env_actions.shape[0])
+            chunks.append(torch.from_numpy(env_actions[:limit]))
+            # Track this chunk's raw action so the rollout driver can hand it
+            # back via record_chunk_observations for replay on the next call.
+            state.prev_model_action = raw_action.astype(np.float32)
+            state.last_action_per_frame = raw_action.shape[2]
+            state.first_chunk = False
+        common_len = min(c.shape[0] for c in chunks)
+        chunks = [c[:common_len] for c in chunks]
+        action_tensor = torch.stack(chunks, dim=0).to(dtype=torch.float32)
+        exec_steps = int(common_len)
+
+        # Fold the backend pieces into the (tensor-only) forward_inputs contract,
+        # now that exec_steps is known. as_dict() is a flat tensor dict so the
+        # actor's split_dict_to_chunk / concat_batch pipeline handles it.
+        forward_inputs = RLForwardInputs.build(
+            action_chains=rl_out["action_chains"],
+            denoise_inds=rl_out["denoise_inds"],
+            init_latent=rl_out["init_latent"],
+            video_latents=rl_out["video_latents"],
+            prompt_embeds=rl_out["prompt_embeds"],
+            negative_prompt_embeds=rl_out["negative_prompt_embeds"],
+            frame_st_id=rl_out["frame_st_id"],
+            noise_level=rl_out["noise_level"],
+            num_action_steps=rl_out["num_action_steps"],
+            exec_steps=exec_steps,
+            action_dim=self.action_dim,
+        )
+
+        # One diffusion-step log-prob per sample, broadcast across the executed
+        # action steps/dims so old_logprobs (here) and new_logprobs (recompute)
+        # share shape.
+        prev_logprobs = broadcast_logprob_to_actions(
+            logprob_b.to(torch.float32), exec_steps, self.action_dim
+        )
+        prev_values = torch.zeros(action_tensor.shape[:2], dtype=torch.float32)
+        result = {
+            "prev_logprobs": prev_logprobs,
+            "prev_values": prev_values,
+            "forward_inputs": forward_inputs.as_dict(),
+        }
+        return action_tensor, result
 
     # ------------------------------------------------------------------
     # Training path
@@ -181,9 +432,10 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         del gradient_checkpointing_kwargs
         if self._ac_applied:
             return
-        if not self.training_mode:
+        if not (self.training_mode or self.rl_mode):
             raise RuntimeError(
-                "gradient_checkpointing_enable is only valid in training_mode."
+                "gradient_checkpointing_enable is only valid in training_mode "
+                "or rl_mode."
             )
         from wan_va.distributed.fsdp import apply_ac
 
@@ -470,8 +722,14 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         )
 
     def predict_action_batch(
-        self, env_obs: dict[str, Any], mode: str = "eval", **_: Any
+        self, env_obs: dict[str, Any], mode: str = "eval", **kwargs: Any
     ):
+        if self.rl_mode:
+            # RL rollout: sample the action chain stochastically (SDE) and
+            # return real per-step log-probs + forward_inputs, with the same
+            # KV-cache replay the eval path uses (driven by the rollout worker's
+            # record_chunk_observations / reset_episode hooks).
+            return self._rl_predict_action_batch(env_obs, mode=mode, **kwargs)
         if mode != "eval":
             raise NotImplementedError(
                 "LingBot-VA Libero adapter only supports eval mode."

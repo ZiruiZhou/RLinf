@@ -66,9 +66,19 @@ def main(cfg) -> None:
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
     )
 
-    # Create rollout worker group
+    # Create rollout worker group. Policies that maintain inter-chunk state
+    # (LingBot-VA's per-env KV-cache replay) need a stateful rollout worker;
+    # everything else uses the generic MultiStepRolloutWorker.
     rollout_placement = component_placement.get_strategy("rollout")
-    rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
+    if str(cfg.rollout.model.model_type) == "lingbotva":
+        from rlinf.workers.rollout.hf.lingbotva_rollout_worker import (
+            LingbotVARolloutWorker,
+        )
+
+        rollout_worker_cls = LingbotVARolloutWorker
+    else:
+        rollout_worker_cls = MultiStepRolloutWorker
+    rollout_group = rollout_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
     )
 

@@ -30,6 +30,17 @@ from rlinf.models.embodiment.lingbotva._utils import (
     extend_import_path,
     load_transformer_state_dict,
 )
+from rlinf.models.embodiment.lingbotva.rl_engine import (
+    RLForwardInputs,
+    normalized_action_sigmas,
+    reduce_chain_logprob,
+    sde_mean_std,
+    select_denoise_index,
+)
+from rlinf.models.embodiment.lingbotva.rl_utils import (
+    gaussian_entropy,
+    gaussian_logprob,
+)
 from rlinf.utils.logging import get_logger
 
 logger = get_logger()
@@ -170,12 +181,14 @@ class LingbotVALiberoBackend:
             server.width // 16 * len(server.job_config.obs_cam_keys),
         )
 
-    def _reset_batch_runtime(self, prompts: list[str]) -> None:
-        if not prompts:
-            raise ValueError("LingBot-VA batch runtime requires at least one prompt.")
+    def _setup_batch_runtime(self, batch_size: int) -> None:
+        """Prompt-free per-batch runtime setup (cache, masks, norm stats).
 
+        Extracted from :meth:`_reset_batch_runtime` so the RL recompute path
+        (which already holds cached prompt embeddings and must not touch the
+        text encoder) can reuse the exact same cache/scheduler/mask setup.
+        """
         server = self._server
-        batch_size = len(prompts)
         server.cache_name = self._BATCH_CACHE_NAME
         server.use_cfg = (server.job_config.guidance_scale > 1) or (
             server.job_config.action_guidance_scale > 1
@@ -215,6 +228,13 @@ class LingbotVALiberoBackend:
             server.job_config.norm_stat["q99"], dtype=torch.float32
         ).reshape(-1, 1, 1)
         server.action_norm_method = server.job_config.action_norm_method
+
+    def _reset_batch_runtime(self, prompts: list[str]) -> None:
+        if not prompts:
+            raise ValueError("LingBot-VA batch runtime requires at least one prompt.")
+
+        self._setup_batch_runtime(len(prompts))
+        server = self._server
         # Cache prompt embeddings by prompt text so we only run the 5.7B-param
         # UMT5 text encoder when we encounter a new prompt. After encoding we
         # offload the text encoder back to CPU (or even free it entirely) to
@@ -708,6 +728,398 @@ class LingbotVALiberoBackend:
                     frame_st_id=frame_st_id,
                 )
         return self._infer_batch_impl(obs_batch, frame_st_id=frame_st_id)
+
+    # ------------------------------------------------------------------
+    # RL (GRPO) — Phase-1 DRAFT (not yet validated against the repo)
+    # ------------------------------------------------------------------
+    # These reproduce the loops in `_infer_batch_impl` with two changes:
+    #   * sampling makes ONE action-denoise step a stochastic SDE and records
+    #     its Gaussian log-prob + the minimal state needed to replay it;
+    #   * recompute re-commits only the single video-cache entry (deterministic)
+    #     then re-runs that one action step with gradients.
+    # The SDE/log-prob math comes from rl_engine / rl_utils (unit-tested). The
+    # `wan_va`-coupled calls are kept byte-for-byte consistent with the eval
+    # loops above; `# VALIDATE:` marks assumptions to confirm with the repo.
+    # Helpers are duplicated (not refactored into the eval path) so the
+    # validated eval/SFT behaviour is untouched until these are tested.
+
+    def _run_video_loop(
+        self, latents: torch.Tensor, batch_size: int, frame_st_id: int
+    ) -> torch.Tensor:
+        """Deterministic video diffusion; populates the KV cache. See the video
+        loop in `_infer_batch_impl` — keep in sync. Returns the final latents.
+        """
+        server = self._server
+        server.scheduler.set_timesteps(server.job_config.num_inference_steps)
+        timesteps = torch.nn.functional.pad(
+            server.scheduler.timesteps, (0, 1), mode="constant", value=0
+        )
+        if server.job_config.video_exec_step != -1:
+            # VALIDATE: the draft assumes video_exec_step == -1 so the single
+            # cache-commit step is the final t=0 forward (see _commit_video_cache).
+            timesteps = timesteps[: server.job_config.video_exec_step]
+        for step_idx, timestep in enumerate(timesteps):
+            last_step = step_idx == len(timesteps) - 1
+            latent_cond = (
+                server.init_latent[:, :, 0:1] if frame_st_id == 0 else None
+            )
+            input_dict = self._prepare_batch_input(
+                latent_model_input=latents,
+                action_model_input=None,
+                latent_t=float(timestep),
+                action_t=float(timestep),
+                latent_cond=latent_cond,
+                action_cond=None,
+                frame_st_id=frame_st_id,
+            )
+            video_noise_pred = server.transformer(
+                input_dict["latent_res_lst"],
+                update_cache=1 if last_step else 0,
+                cache_name=server.cache_name,
+                action_mode=False,
+            )
+            if not last_step or server.job_config.video_exec_step != -1:
+                video_noise_pred = self._data_seq_to_patch(
+                    server.job_config.patch_size,
+                    video_noise_pred,
+                    server.job_config.frame_chunk_size,
+                    server.latent_height,
+                    server.latent_width,
+                    batch_size=self._cfg_batch_size(batch_size),
+                )
+                if server.job_config.guidance_scale > 1:
+                    video_noise_pred = video_noise_pred[
+                        batch_size:
+                    ] + server.job_config.guidance_scale * (
+                        video_noise_pred[:batch_size]
+                        - video_noise_pred[batch_size:]
+                    )
+                else:
+                    video_noise_pred = video_noise_pred[:batch_size]
+                latents = server.scheduler.step(
+                    video_noise_pred, timestep, latents, return_dict=False
+                )
+            if latent_cond is not None:
+                latents[:, :, 0:1] = latent_cond
+        return latents
+
+    def _commit_video_cache(
+        self, video_latents: torch.Tensor, batch_size: int, frame_st_id: int
+    ) -> None:
+        """Re-run ONLY the final (t=0, update_cache=1) video forward.
+
+        Only that forward writes the KV cache the action steps read, so this
+        reproduces the action-conditioning deterministically from the stored
+        final video latents — no need to replay the whole video diffusion.
+        """
+        server = self._server
+        latent_cond = server.init_latent[:, :, 0:1] if frame_st_id == 0 else None
+        input_dict = self._prepare_batch_input(
+            latent_model_input=video_latents,
+            action_model_input=None,
+            latent_t=0.0,
+            action_t=0.0,
+            latent_cond=latent_cond,
+            action_cond=None,
+            frame_st_id=frame_st_id,
+        )
+        server.transformer(
+            input_dict["latent_res_lst"],
+            update_cache=1,
+            cache_name=server.cache_name,
+            action_mode=False,
+        )
+
+    def _action_velocity(
+        self,
+        actions: torch.Tensor,
+        timestep: float,
+        frame_st_id: int,
+        batch_size: int,
+        update_cache: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """One action-transformer forward -> velocity reshaped to `actions`.
+
+        Mirrors the per-step body of `_infer_batch_impl`'s action loop up to
+        (but excluding) `action_scheduler.step`. Returns `(velocity, action_cond)`.
+        """
+        server = self._server
+        action_cond = (
+            torch.zeros(
+                [batch_size, server.job_config.action_dim, 1, server.action_per_frame, 1],
+                device=server.device,
+                dtype=server.dtype,
+            )
+            if frame_st_id == 0
+            else None
+        )
+        input_dict = self._prepare_batch_input(
+            latent_model_input=None,
+            action_model_input=actions,
+            latent_t=float(timestep),
+            action_t=float(timestep),
+            latent_cond=None,
+            action_cond=action_cond,
+            frame_st_id=frame_st_id,
+        )
+        action_noise_pred = server.transformer(
+            input_dict["action_res_lst"],
+            update_cache=update_cache,
+            cache_name=server.cache_name,
+            action_mode=True,
+        )
+        action_noise_pred = (
+            action_noise_pred.unflatten(
+                1, (server.job_config.frame_chunk_size, server.action_per_frame)
+            )
+            .permute(0, 3, 1, 2)
+            .unsqueeze(-1)
+        )
+        if server.job_config.action_guidance_scale > 1:
+            action_noise_pred = action_noise_pred[
+                batch_size:
+            ] + server.job_config.action_guidance_scale * (
+                action_noise_pred[:batch_size] - action_noise_pred[batch_size:]
+            )
+        else:
+            action_noise_pred = action_noise_pred[:batch_size]
+        return action_noise_pred, action_cond
+
+    def _mask_action_std(
+        self, std: torch.Tensor, action_cond: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Zero the SDE std on coordinates with no randomness.
+
+        Unused action channels (``~action_mask``) and, on the first chunk, the
+        conditioned frame 0 are deterministic, so they must not contribute to
+        the log-prob (``gaussian_logprob`` returns 0 where std == 0).
+        """
+        std = std.clone()
+        std[:, ~self._server.action_mask] = 0.0
+        if action_cond is not None:
+            std[:, :, 0:1] = 0.0
+        return std
+
+    def infer_batch_with_logprob(
+        self,
+        obs_batch: list[dict[str, Any]],
+        prompts: list[str],
+        *,
+        noise_level: float = 1.0,
+        kv_cache_histories: (
+            list[list[tuple[list[dict[str, Any]], np.ndarray]]] | None
+        ) = None,
+    ) -> dict[str, Any]:
+        """RL rollout: sample the action chain as an SDE and return log-probs.
+
+        Mirrors :meth:`infer_batch` (incl. cross-chunk KV-cache replay) but makes
+        one action-denoise step stochastic and returns its Gaussian log-prob.
+        When ``kv_cache_histories`` is given, the prior chunks' key-frame obs +
+        actions are replayed into the transformer's KV cache (advancing
+        ``frame_st_id``) before the current chunk is generated — this is what
+        restores non-zero rollout success rate.
+
+        Returns the raw pieces the caller folds into an ``RLForwardInputs``.
+        NOTE: under replay (``frame_st_id > 0``) the action conditioning depends
+        on the replayed cache; ``recompute_logprob`` currently reproduces only
+        the single video commit, so recompute consistency under replay is a
+        follow-up (RL_DESIGN.md; task: distributed recompute consistency).
+        """
+        if len(obs_batch) != len(prompts):
+            raise ValueError(
+                "infer_batch_with_logprob expects equal numbers of obs and "
+                f"prompts, got {len(obs_batch)} and {len(prompts)}."
+            )
+        self._reset_batch_runtime(prompts)
+        server = self._server
+        frame_st_id = 0
+        obs_sequences = self._normalize_obs_sequences(obs_batch)
+        batch_size = len(obs_sequences)
+
+        with torch.no_grad():
+            # Replay prior chunks into the KV cache (mirrors infer_batch).
+            if kv_cache_histories and any(len(h) > 0 for h in kv_cache_histories):
+                history_lengths = {len(h) for h in kv_cache_histories}
+                if len(history_lengths) != 1:
+                    raise ValueError(
+                        "infer_batch_with_logprob requires uniform kv history "
+                        f"lengths across the batch, got {history_lengths}."
+                    )
+                history_len = history_lengths.pop()
+                server.init_latent = self._encode_obs_batch(obs_batch)
+                for history_idx in range(history_len):
+                    hist_obs = [h[history_idx][0] for h in kv_cache_histories]
+                    state_batch = np.stack(
+                        [h[history_idx][1] for h in kv_cache_histories], axis=0
+                    )
+                    frame_st_id = self._compute_kv_cache_batch_impl(
+                        obs_batch=hist_obs,
+                        state_batch=state_batch,
+                        frame_st_id=frame_st_id,
+                    )
+            else:
+                server.init_latent = self._encode_obs_batch(obs_sequences)
+            latents = torch.randn(
+                batch_size,
+                48,
+                server.job_config.frame_chunk_size,
+                server.latent_height,
+                server.latent_width,
+                device=server.device,
+                dtype=server.dtype,
+            )
+            actions = torch.randn(
+                batch_size,
+                server.job_config.action_dim,
+                server.job_config.frame_chunk_size,
+                server.action_per_frame,
+                1,
+                device=server.device,
+                dtype=server.dtype,
+            )
+            video_latents = self._run_video_loop(latents, batch_size, frame_st_id)
+
+            server.action_scheduler.set_timesteps(
+                server.job_config.action_num_inference_steps
+            )
+            action_timesteps = torch.nn.functional.pad(
+                server.action_scheduler.timesteps, (0, 1), mode="constant", value=0
+            )
+            num_action_steps = len(action_timesteps) - 1
+            sigmas_padded = normalized_action_sigmas(
+                server.action_scheduler, num_action_steps
+            )
+            chosen_step = select_denoise_index(num_action_steps)
+
+            chains_pre = chains_next = None
+            logprob = None
+            for step_idx, timestep in enumerate(action_timesteps):
+                last_step = step_idx == len(action_timesteps) - 1
+                if last_step:
+                    # Commit the action cache (matches eval's update_cache=1).
+                    self._action_velocity(
+                        actions, timestep, frame_st_id, batch_size, update_cache=1
+                    )
+                    break
+                v_t, action_cond = self._action_velocity(
+                    actions, timestep, frame_st_id, batch_size, update_cache=0
+                )
+                if step_idx == chosen_step:
+                    mean, std = sde_mean_std(
+                        actions, v_t, sigmas_padded, step_idx, noise_level
+                    )
+                    std = self._mask_action_std(std, action_cond)
+                    next_actions = mean + torch.randn_like(mean) * std
+                    logprob = reduce_chain_logprob(
+                        gaussian_logprob(next_actions, mean, std)
+                    )
+                    chains_pre = actions.clone()
+                    chains_next = next_actions.clone()
+                    actions = next_actions
+                else:
+                    actions = server.action_scheduler.step(
+                        v_t, timestep, actions, return_dict=False
+                    )
+                if action_cond is not None:
+                    actions[:, :, 0:1] = action_cond
+
+            actions[:, ~server.action_mask] *= 0
+
+        if logprob is None:
+            raise RuntimeError("RL rollout did not score any denoise step.")
+        raw_actions = self._postprocess_action_batch(actions)
+        torch.cuda.empty_cache()
+        return {
+            "actions": raw_actions,
+            "logprob": logprob.detach().cpu(),
+            # Pieces for RLForwardInputs.build (caller adds exec_steps).
+            "action_chains": torch.stack([chains_pre, chains_next], dim=1).cpu(),
+            "denoise_inds": torch.full((batch_size,), chosen_step, dtype=torch.long),
+            "init_latent": server.init_latent.detach().cpu(),
+            "video_latents": video_latents.detach().cpu(),
+            "prompt_embeds": server.prompt_embeds.detach().cpu(),
+            "negative_prompt_embeds": (
+                server.negative_prompt_embeds.detach().cpu()
+                if server.negative_prompt_embeds is not None
+                else None
+            ),
+            "frame_st_id": frame_st_id,
+            "noise_level": float(noise_level),
+            "num_action_steps": num_action_steps,
+            "action_dim": server.job_config.action_dim,
+        }
+
+    def recompute_logprob(
+        self,
+        forward_inputs: RLForwardInputs,
+        *,
+        compute_entropy: bool = False,
+        compute_values: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """RL update: recompute the scored step's log-prob WITH gradients.
+
+        Re-commits the single video-cache entry deterministically from the
+        stored final video latents, then re-runs the one stored action-denoise
+        step through the (trainable) transformer. Gradients flow through the
+        action step only; the video conditioning is treated as fixed (run under
+        ``no_grad``), mirroring how OpenPI/lingbotvla detach the prefix.
+        """
+        server = self._server
+        fi = forward_inputs.to(server.device)
+        batch_size = fi.action_chains.shape[0]
+        denoise_inds = fi.denoise_inds.to(torch.long)
+        num_action_steps = fi.scalar_num_action_steps
+        frame_st_id = fi.scalar_frame_st_id
+        noise_level = fi.scalar_noise_level
+
+        self._setup_batch_runtime(batch_size)
+        server.init_latent = fi.init_latent
+        server.prompt_embeds = fi.prompt_embeds
+        server.negative_prompt_embeds = fi.negative_prompt_embeds
+
+        with torch.no_grad():
+            self._commit_video_cache(fi.video_latents, batch_size, frame_st_id)
+
+        server.action_scheduler.set_timesteps(num_action_steps)
+        action_timesteps = torch.nn.functional.pad(
+            server.action_scheduler.timesteps, (0, 1), mode="constant", value=0
+        )
+        sigmas_padded = normalized_action_sigmas(
+            server.action_scheduler, num_action_steps
+        )
+        chains_pre = fi.action_chains[:, 0]
+        chains_next = fi.action_chains[:, 1]
+
+        # The single action forward uses one scalar timestep, so all samples in
+        # the micro-batch must share the scored step. This holds for
+        # micro_batch_size == 1 (the RL config). # VALIDATE: heterogeneous
+        # micro-batches need per-sample action timesteps in _prepare_batch_input
+        # (as OpenPI's action expert supports); raise clearly until then.
+        unique_steps = torch.unique(denoise_inds)
+        if unique_steps.numel() != 1:
+            raise NotImplementedError(
+                "recompute_logprob got mixed denoise_inds "
+                f"{unique_steps.tolist()} in one micro-batch. Set "
+                "actor.micro_batch_size=1, or implement per-sample action "
+                "timesteps in _prepare_batch_input."
+            )
+        timestep = float(action_timesteps[int(unique_steps.item())])
+
+        # Gradients on: this is the only forward the GRPO update backprops.
+        v_t, action_cond = self._action_velocity(
+            chains_pre, timestep, frame_st_id, batch_size, update_cache=0
+        )
+        mean, std = sde_mean_std(
+            chains_pre, v_t, sigmas_padded, denoise_inds, noise_level
+        )
+        std = self._mask_action_std(std, action_cond)
+        logprobs = reduce_chain_logprob(gaussian_logprob(chains_next, mean, std))
+        if compute_entropy:
+            entropy = reduce_chain_logprob(gaussian_entropy(std))
+        else:
+            entropy = torch.zeros(batch_size, device=server.device)
+        values = torch.zeros(batch_size, device=server.device)  # GRPO: critic-free
+        return {"logprobs": logprobs, "entropy": entropy, "values": values}
 
     def close(self) -> None:
         if getattr(self, "_server", None) is None:
