@@ -1258,20 +1258,25 @@ class LingbotVALiberoBackend:
         server.prompt_embeds = fi.prompt_embeds
         server.negative_prompt_embeds = fi.negative_prompt_embeds
 
+        # Replaying the per-chunk history makes the recompute log-prob exact
+        # (ratio==1), but it runs a DATA-DEPENDENT number of transformer forwards
+        # (history grows with chunk index). Under FSDP each forward all-gathers
+        # params, so different data-parallel ranks issue different collectives
+        # and DEADLOCK (NCCL watchdog timeout). Until a rank-symmetric replay
+        # (pad every rank to a global-max forward count) lands, this knob lets
+        # distributed training skip the replay: the recompute then does a fixed
+        # 2 forwards/sample (commit + action) -> identical across ranks -> synced,
+        # at the cost of a mild history-conditioning bias in the ratio (~0.7).
+        replay = bool(getattr(self.cfg.lingbotva, "recompute_kv_replay", True))
         with torch.no_grad():
-            # Replay the prior chunks' KV cache that the rollout's scored action
-            # step attended to. Each stored entry's latent already includes the
-            # first-chunk init_latent prepend (captured post-prepend at rollout),
-            # so we replay them verbatim, advancing frame_st_id from 0. Without
-            # this the action step sees only the current video -> a systematic,
-            # history-length-growing log-prob bias (recompute consistency).
-            replay_frame_st_id = self._replay_history_cache(fi, batch_size)
-            if replay_frame_st_id != frame_st_id:
-                raise RuntimeError(
-                    "recompute history replay reached frame_st_id "
-                    f"{replay_frame_st_id} but forward_inputs stored "
-                    f"{frame_st_id}; KV-replay history pack is inconsistent."
-                )
+            if replay:
+                replay_frame_st_id = self._replay_history_cache(fi, batch_size)
+                if replay_frame_st_id != frame_st_id:
+                    raise RuntimeError(
+                        "recompute history replay reached frame_st_id "
+                        f"{replay_frame_st_id} but forward_inputs stored "
+                        f"{frame_st_id}; KV-replay history pack is inconsistent."
+                    )
             self._commit_video_cache(fi.video_latents, batch_size, frame_st_id)
 
         server.action_scheduler.set_timesteps(num_action_steps)

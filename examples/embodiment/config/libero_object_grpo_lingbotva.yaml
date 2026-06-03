@@ -227,6 +227,13 @@ actor:
       # max_frames  >= cumulative latent frames over that many chunks.
       kv_replay_max_history: 24
       kv_replay_max_frames: 80
+      # Whether the ACTOR recompute replays the stored history KV cache. True =
+      # exact log-prob (ratio==1) but runs a data-dependent number of FSDP
+      # forwards per sample, which deadlocks DP ranks' lockstep collectives in
+      # distributed training. Set False for distributed runs (recompute then does
+      # a fixed 2 forwards/sample -> synced; mild history-conditioning bias in
+      # the ratio). The rollout always replays (enable_kv_cache_replay) for SR.
+      recompute_kv_replay: True
       # RL actor: rl_mode builds the backend and exposes its transformer as an
       # FSDP-wrapped child so the GRPO update recomputes log-probs with
       # gradients. (rl_mode supersedes training_mode; do not set both.)
@@ -254,7 +261,13 @@ actor:
     use_orig_params: False
     gradient_checkpointing: True
     limit_all_gathers: True
-    reshard_after_forward: True
+    # MUST stay False for lingbotva RL: the recompute replays a data-dependent
+    # number of KV-cache forwards per sample (history grows with chunk index),
+    # so resharding after each forward would make different DP ranks issue
+    # different per-layer all-gathers and deadlock FSDP's lockstep collectives
+    # (NCCL watchdog timeout). With reshard off, params gather once (synced on
+    # the first forward) and are reused for every replay/commit/action forward.
+    reshard_after_forward: False
     grad_scaler:
       enabled: False
     mixed_precision:
