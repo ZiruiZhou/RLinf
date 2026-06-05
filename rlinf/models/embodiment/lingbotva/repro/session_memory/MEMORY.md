@@ -1,0 +1,1 @@
+- [LingBot-VA RL (GRPO)](lingbotva-rl-grpo.md) — ongoing: adding GRPO RL for the lingbotva model on top of PR#1220; Phase 0 scaffolding+math done on branch feat/lingbotva-rl-grpo
