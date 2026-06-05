@@ -10,9 +10,23 @@ records *what we observed*, not how the RL core works.
 ## TL;DR
 
 **GRPO RL raises Libero-Object success rate over SFT — but only with the
-(near-)exact gradient and ~20 steps.** Deterministic eval on the trained tasks
-{2,6}: SFT 40.0% → exact-gradient step 20 **66.7% (+26.7%, z=2.15, p≈0.03)**, a
-monotonic rise across checkpoints.
+(near-)exact gradient and ~20+ steps.** Deterministic eval on the trained tasks
+{2,6} over 30 training steps: SFT 40.0% → peak **70.0% at step 30
+(+30.0%, z=2.45, p≈0.014)**, with step 20 also significant
+(66.7%, +26.7%, z=2.15). The curve rises in a noisy envelope rather than
+monotonically — two independent checkpoints (20 and 30) clear z>2.1, while the
+intervening step 25 dipped back to 46.7%, mirroring the training-metric
+oscillation. At n=30 the per-checkpoint CIs are wide (~±17pt); the robust signal
+is the rising envelope and the two significant peaks, not any single step.
+
+```
+sft     40.0% (12/30)
+exact10 43.3%  +3.3  z=0.26
+exact15 46.7%  +6.7  z=0.52
+exact20 66.7% +26.7  z=2.15   significant
+exact25 46.7%  +6.7  z=0.52   dip
+exact30 70.0% +30.0  z=2.45   peak, significant
+```
 
 The bottleneck was the **gradient**. The distributed-synced recompute originally
 had to drop the KV-cache replay (`recompute_kv_replay=false`, proximal
@@ -193,14 +207,15 @@ wall-clock lever is fewer training steps (gains peak early anyway).
   false OOM): `ray stop --force; pkill -9 -f "ray::|train_embodied"; verify
   `nvidia-smi` ~0 MiB`.
 
-## Exact gradient RAISES SR (+26.7%, significant) — the key positive result
+## Exact gradient RAISES SR (peak +30%, significant) — the key positive result
 
 The biased gradient (proximal ratio ≈ 0.6) was the wall. Making the recompute
-(near-)exact (ratio ≈ 0.91) **and running ~20 steps** produces a clear,
+(near-)exact (ratio ≈ 0.91) **and running ~20+ steps** produces a clear,
 statistically significant success-rate gain over SFT — something no biased-
 gradient run ever achieved at any tuning.
 
-Deterministic (noise=0) eval on the trained tasks {2,6}, 30 episodes each:
+Deterministic (noise=0) eval on the trained tasks {2,6}, 30 episodes each,
+across the full 30-step run:
 
 | checkpoint | SR | Δ vs SFT | z |
 | --- | --- | --- | --- |
@@ -208,10 +223,20 @@ Deterministic (noise=0) eval on the trained tasks {2,6}, 30 episodes each:
 | exact step 10 | 43.3% (13/30) | +3.3% | +0.26 |
 | exact step 15 | 46.7% (14/30) | +6.7% | +0.52 |
 | **exact step 20** | **66.7% (20/30)** | **+26.7%** | **+2.15** |
+| exact step 25 | 46.7% (14/30) | +6.7% | +0.52 |
+| **exact step 30** | **70.0% (21/30)** | **+30.0%** | **+2.45** |
 
-A monotonic, *accelerating* rise (40 → 43 → 47 → 67) across four independent
-checkpoints — significant at step 20 (p ≈ 0.03), and the trajectory shape makes
-noise very unlikely. Both tasks improved (t2 6→8, t6 6→12).
+A rising but **noisy envelope** (40 → 43 → 47 → **67** → 47 → **70**): two
+independent checkpoints (20 and 30) both clear z>2.1 (peak p ≈ 0.014), while the
+intervening step 25 fell back to 46.7%. The oscillation mirrors the training
+`success_once` trace (which alternated high/low step-to-step), so it is sampling
+noise on top of a real upward trend, not a clean monotone climb. At n=30 the
+per-checkpoint 95% CIs are wide (±~17pt); the robust evidence is the *two*
+significant peaks plus the rising floor, not any single step. At the step-30
+peak both tasks improved (t2 6→11, t6 6→10).
+
+To tighten this, the natural next step is more eval episodes (n=30 → 60–90) on
+steps 20 and 30 to confirm the peak and shrink the CI.
 
 **Lesson — measurement and patience both mattered.** The training `success_once`
 (noise=1.0) was noisy-flat (~0.40) the entire run and was *misleading*; only the
@@ -288,9 +313,10 @@ slower rollout (envs keep stepping after success). Required a one-line actor fix
 
 ## Path forward
 
-1. **Confirm and scale the win.** Extend past step 20 (still climbing?), tighten
-   the +26.7% CI with more eval episodes (n=30 → 60–90), then scale to more envs
-   and more tasks to test that the gain generalizes beyond {2,6}.
+1. **Confirm and scale the win.** Step 30 reached the peak (+30.0%, z=2.45) — the
+   run is no longer monotone but the envelope still rises. Tighten the step-20/30
+   peaks with more eval episodes (n=30 → 60–90) to shrink the wide CIs, then scale
+   to more envs and more tasks to test that the gain generalizes beyond {2,6}.
 2. **(Optional) true ratio = 1.0 — rank-symmetric padded replay.** The current
    0.91 already works; a true 1.0 would `all_gather` the chunk-key union across
    DP ranks and run padding `_recompute_group`s (with a 0-weight loss term so
