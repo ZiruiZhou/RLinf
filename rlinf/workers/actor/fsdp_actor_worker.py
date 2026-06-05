@@ -1121,10 +1121,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_epoch = self.cfg.algorithm.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
 
-        if (
-            not self.cfg.env.train.auto_reset
-            and not self.cfg.env.train.ignore_terminations
-        ):
+        if not self.cfg.env.train.auto_reset:
+            # Build the loss mask whenever episodes are not auto-reset. With
+            # ignore_terminations=True every env runs the full horizon, so dones
+            # carry no early terminations and compute_loss_mask yields an
+            # all-ones mask (post-success steps, if dones still mark success,
+            # are correctly masked out). This also keeps the rollout buffer
+            # non-ragged, which the exact KV-replay recompute needs to stay
+            # FSDP-rank-symmetric. Previously this branch was skipped for
+            # ignore_terminations, leaving loss_mask=None and crashing GRPO
+            # advantage computation.
             dones = rollout_batch[
                 "dones"
             ]  # [n_chunk_step, rollout_epoch x bsz, num_action_chunks]
