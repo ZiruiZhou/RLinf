@@ -187,22 +187,44 @@ wall-clock lever is fewer training steps (gains peak early anyway).
   false OOM): `ray stop --force; pkill -9 -f "ray::|train_embodied"; verify
   `nvidia-smi` ~0 MiB`.
 
+## Exact gradient: status and the deadlock root cause
+
+The exact unbiased recompute (`recompute_kv_replay=true`) is **correct**: a short
+4-chunk (48-step) distributed run gives `actor/ratio = 1.000`, `ratio_abs = 0`,
+no deadlock. But the full **20-chunk (240-step)** run **deadlocks** — actor GPUs
+pin at 100% util with frozen memory (NCCL spin-wait) right after the rollout,
+rollout GPUs idle, no progress.
+
+**Root cause: ragged buffer from early termination.** Libero episodes stop when
+the task succeeds (`env.train.ignore_terminations=False`), so deep chunks have
+fewer surviving envs than shallow ones — and *which* envs survive differs per
+actor rank. The actor splits each rank's local buffer into micro-batches
+independently, and `recompute_logprob` replays a number of FSDP forwards that
+depends on the chunk's `frame_st_id` depth. So at micro-step *k*, one rank is on
+a shallow chunk (few replay forwards) while another is on a deep one (many) →
+mismatched all-gather sequence → deadlock. (4 chunks works because there is
+little raggedness; it breaks as episodes spread out — explaining why prior
+micro=1 and micro=4 attempts both died at 240 steps.)
+
 ## Path forward
 
-1. **Exact unbiased gradient (rank-symmetric padded replay)** — the principled
-   fix and most likely lever to actually raise SR. Set
-   `recompute_kv_replay=true`, then in the actor recompute `all_reduce(MAX)` the
-   per-rank replay-forward count and have every rank do `global_max` replay
-   iterations (real entries write the real cache; padding iterations run
-   `update_cache=0` no-op forwards into a scratch cache) → identical FSDP
-   collectives across ranks *and* an exact ratio = 1.0.
-   Single-process this is bit-exact (gate #1; short-run ratio=1.000); it
-   deadlocks distributed only because per-rank trajectories replay a
-   data-dependent number of forwards — the `all_reduce(MAX)` padding fixes
-   exactly that. Feasibility hinges on doing the replay *batched by chunk*
-   (group rows by `frame_st_id` so envs in a chunk replay together), since the
-   per-sample micro=1 replay was the original perf blocker (~21 min for just 4
-   chunks); batched + rank-symmetric should keep it to minutes/step.
+1a. **Cheap shortcut — non-ragged buffer.** Set
+   `env.train.ignore_terminations=True` so every env runs the full 240 steps →
+   buffer is a clean `[chunks × envs]` grid → per-rank chunk composition is
+   uniform → ranks issue identical collectives by construction, *no padding code
+   needed*. Trade-off: larger buffer + slower rollout (envs keep stepping after
+   success), and post-success steps add some reward noise. Test this first.
+1b. **Full fix — rank-symmetric padded replay** (if the shortcut is too slow or
+   hurts the signal). `all_gather` the chunk-key union across DP ranks; every
+   rank iterates the same global sorted keys; for keys it lacks, run a padding
+   `_recompute_group` on a synthetic 1-row batch at that chunk's depth (matching
+   forward count) and route its action log-prob through a **0-weight loss term**
+   so the *backward* collectives also match (the replay is `no_grad` and only
+   forward-syncs; the scored action forward's backward must sync too — the subtle
+   trap). Touches `recompute_logprob`, its return contract, and the actor loss.
+   Single-process this is bit-exact (gate #1, ratio=1.000); batched by chunk it
+   runs in minutes/step (the per-sample micro=1 replay was the original perf
+   blocker, ~21 min for 4 chunks).
 2. **Tuning is exhausted.** The cheap knobs (lr, noise, group size, task focus)
    have all been swept and none raise SR on the biased gradient — so further
    hyperparameter search is not worthwhile; the gradient is the bottleneck.
