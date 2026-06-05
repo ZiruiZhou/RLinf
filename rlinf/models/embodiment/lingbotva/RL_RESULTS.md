@@ -20,9 +20,12 @@ Two independent runs land flat-to-marginal:
 | 16-env / group-4 | step 5 | 54.4% vs 45.6% (**+8.9%**) | z = +1.20 (n.s.) |
 | 64-env / group-8 | step 10 & 20 | 47.8% vs 45.6% (**+2.2%**) | z = +0.30 (n.s.) |
 
-The prime suspect is the biased gradient (`recompute_kv_replay=false`,
-proximal ratio ≈ 0.6). The indicated next step is the **exact unbiased
-gradient** (rank-symmetric padded replay) — see *Path forward*.
+A full tuning sweep (task count, group size, exploration noise, learning rate)
+and a focused 2-task experiment all stayed flat — and a higher lr actively
+*degraded* SR. This isolates the **biased gradient** (`recompute_kv_replay=false`,
+proximal ratio ≈ 0.6), not tuning or task dilution, as the wall. The indicated
+next step is the **exact unbiased gradient** (rank-symmetric padded replay) —
+see *Path forward*.
 
 ## Setup
 
@@ -116,6 +119,45 @@ went 2/9 → **9/9** but tasks 2 and 4 regressed — net wash.
 The run **crashed at step ~30 on a full disk** before step 30's weights were
 written (steps 10 & 20 salvaged). See *Operational notes*.
 
+### Hyperparameter tuning + 2-task focus (the dilution hypothesis)
+
+To rule out that the flatness was a *tuning* problem rather than a *gradient*
+problem, we swept the cheap knobs. All on the biased gradient:
+
+| Variant | Result |
+| --- | --- |
+| 10 tasks, lr 1e-6 / 3e-6 | flat (~0.5 training-rollout SR, no trend) |
+| group_size 2 / 4 / 8 | flat (group_size≥4 fixes sparse advantage, but SR still flat) |
+| rl_noise_level 1.0 / 0.5 | flat |
+| lr 5e-6 | **degrades** (see below) |
+| **2-task focus** (tasks 2 & 6) | **flat** |
+
+**Dilution hypothesis (rejected).** Idea: training across all 10 tasks dilutes
+the gradient and stalls SR; focus on 2 mid-SR tasks (2 & 6, both ~50% SFT = max
+GRPO within-group outcome variance) with many envs each (96 → ~48/task). Run on
+the training tasks only (`env.train.task_id_filter=[2,6]`; `success_once` then
+measured on exactly those tasks). Result over 12 steps (lr=3e-6, noise=1.0):
+
+```
+step: 1     2     3     4     5     6     7     8     9    10    11    12
+SR:  .240  .229  .156  .344  .250  .208  .208  .260  .219  .177  .271  .240
+```
+
+first-6 mean 0.238, last-6 mean 0.229 — **flat**, just like all-10. Focusing the
+gradient did not help.
+
+**Higher lr actively degrades.** A 2-task run at **lr=5e-6** (noise=0.5)
+monotonically *decreased* SR `.354 → .250 → .198 → .188` over 4 steps with reward
+falling in lockstep. The biased gradient points in a subtly wrong direction on
+deep chunks; on 10 tasks at lr=3e-6 those errors partly average out (→ flat), but
+with a bigger step the bias compounds and walks the policy downhill. So the
+biased gradient is not merely weak — it is *wrong*, and only a gentle lr hides it.
+
+**Conclusion:** across task count, group size, exploration noise, and learning
+rate, the biased no-replay gradient never raises SR — it is flat at best and
+degrading at worst. This isolates the **gradient** (not tuning, not task
+dilution) as the wall. The exact unbiased gradient is the required next step.
+
 ## Rollout-speed investigation (no good free speedup)
 
 Rollout is ~100% diffusion generation: ≈90 transformer forwards per action chunk
@@ -154,6 +196,13 @@ wall-clock lever is fewer training steps (gains peak early anyway).
    iterations (real entries write the real cache; padding iterations run
    `update_cache=0` no-op forwards into a scratch cache) → identical FSDP
    collectives across ranks *and* an exact ratio = 1.0.
-2. **Cheaper experiments meanwhile:** resume from step 20 (DCP kept) to
-   step 40–50, and tune `lr` / `rl_noise_level` / `group_size`, still on the
-   biased gradient. Lower expected value given two flat runs, but fast.
+   Single-process this is bit-exact (gate #1; short-run ratio=1.000); it
+   deadlocks distributed only because per-rank trajectories replay a
+   data-dependent number of forwards — the `all_reduce(MAX)` padding fixes
+   exactly that. Feasibility hinges on doing the replay *batched by chunk*
+   (group rows by `frame_st_id` so envs in a chunk replay together), since the
+   per-sample micro=1 replay was the original perf blocker (~21 min for just 4
+   chunks); batched + rank-symmetric should keep it to minutes/step.
+2. **Tuning is exhausted.** The cheap knobs (lr, noise, group size, task focus)
+   have all been swept and none raise SR on the biased gradient — so further
+   hyperparameter search is not worthwhile; the gradient is the bottleneck.
