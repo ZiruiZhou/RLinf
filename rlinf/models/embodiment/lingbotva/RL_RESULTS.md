@@ -273,25 +273,31 @@ mismatched all-gather sequence → deadlock. (4 chunks works because there is
 little raggedness; it breaks as episodes spread out — explaining why prior
 micro=1 and micro=4 attempts both died at 240 steps.)
 
+## How the exact gradient was enabled (the `ignore_terminations` shortcut)
+
+The exact recompute (`recompute_kv_replay=true`) deadlocks distributed because
+early episode termination makes the rollout buffer ragged → per-rank replay-
+forward counts diverge → FSDP collectives desync (see the deadlock section).
+**Fix that worked:** `env.train.ignore_terminations=True` makes every env run the
+full 240 steps → buffer is a clean `[chunks × envs]` grid → per-rank chunk
+composition is uniform → ranks issue identical collectives by construction, *no
+padding code needed*. This is what produced the +26.7% result above
+(ratio ≈ 0.91; the 0.09 is bf16 drift over the deep replayed history). Cost:
+slower rollout (envs keep stepping after success). Required a one-line actor fix
+(build `loss_mask` when `ignore_terminations`, else GRPO crashed on `None`).
+
 ## Path forward
 
-1a. **Cheap shortcut — non-ragged buffer.** Set
-   `env.train.ignore_terminations=True` so every env runs the full 240 steps →
-   buffer is a clean `[chunks × envs]` grid → per-rank chunk composition is
-   uniform → ranks issue identical collectives by construction, *no padding code
-   needed*. Trade-off: larger buffer + slower rollout (envs keep stepping after
-   success), and post-success steps add some reward noise. Test this first.
-1b. **Full fix — rank-symmetric padded replay** (if the shortcut is too slow or
-   hurts the signal). `all_gather` the chunk-key union across DP ranks; every
-   rank iterates the same global sorted keys; for keys it lacks, run a padding
-   `_recompute_group` on a synthetic 1-row batch at that chunk's depth (matching
-   forward count) and route its action log-prob through a **0-weight loss term**
-   so the *backward* collectives also match (the replay is `no_grad` and only
-   forward-syncs; the scored action forward's backward must sync too — the subtle
-   trap). Touches `recompute_logprob`, its return contract, and the actor loss.
-   Single-process this is bit-exact (gate #1, ratio=1.000); batched by chunk it
-   runs in minutes/step (the per-sample micro=1 replay was the original perf
-   blocker, ~21 min for 4 chunks).
-2. **Tuning is exhausted.** The cheap knobs (lr, noise, group size, task focus)
-   have all been swept and none raise SR on the biased gradient — so further
-   hyperparameter search is not worthwhile; the gradient is the bottleneck.
+1. **Confirm and scale the win.** Extend past step 20 (still climbing?), tighten
+   the +26.7% CI with more eval episodes (n=30 → 60–90), then scale to more envs
+   and more tasks to test that the gain generalizes beyond {2,6}.
+2. **(Optional) true ratio = 1.0 — rank-symmetric padded replay.** The current
+   0.91 already works; a true 1.0 would `all_gather` the chunk-key union across
+   DP ranks and run padding `_recompute_group`s (with a 0-weight loss term so
+   *backward* collectives match) for keys a rank lacks — removing the
+   `ignore_terminations` rollout-speed cost. Only worth it if the bf16 drift
+   becomes a limiter.
+3. **Tuning, revisited.** The earlier sweep (lr, noise, group size, task focus)
+   was all on the *biased* gradient and stayed flat; with the exact gradient now
+   working, re-sweeping lr / steps may yield further gains (the win used a
+   conservative lr=3e-6).
