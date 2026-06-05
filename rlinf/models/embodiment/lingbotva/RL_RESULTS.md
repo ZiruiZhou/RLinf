@@ -187,7 +187,40 @@ wall-clock lever is fewer training steps (gains peak early anyway).
   false OOM): `ray stop --force; pkill -9 -f "ray::|train_embodied"; verify
   `nvidia-smi` ~0 MiB`.
 
-## Exact gradient: status and the deadlock root cause
+## Exact gradient does NOT raise SR (the key negative result)
+
+The biased gradient was the leading suspect for the flat SR. We made the
+recompute (near-)exact and re-ran — and SR stayed flat. So the gradient was
+**not** the bottleneck.
+
+- **Mechanism fixed:** with `ignore_terminations=true` (non-ragged buffer →
+  FSDP rank-symmetric, see below) the exact recompute (`recompute_kv_replay=true`)
+  runs distributed at full 240-step length with `actor/ratio ≈ 0.91` every step
+  (vs the biased 0.6). The residual 0.09 is bf16 drift over the deep replayed
+  history; a true 1.0 would need the rank-symmetric padding build (1b below).
+- **Real training run** (tasks 2 & 6, 32 envs, lr=3e-6, noise=1.0): training
+  `success_once` over 10 steps stayed noisy-flat (~0.37) — but that metric is
+  unreliable (noise=1.0). The deterministic (noise=0) eval of the step-10
+  checkpoint on the trained tasks:
+
+  | | SR (30 ep) | t2 | t6 |
+  | --- | --- | --- | --- |
+  | SFT | 40.0% (12/30) | 6/15 | 6/15 |
+  | exact step 10 | 43.3% (13/30) | 5/15 | 8/15 |
+
+  Δ = +3.3%, z = +0.26 — **not significant**. Flat.
+
+**Conclusion:** moving the gradient from biased (ratio 0.6) to near-exact (0.91)
+— a large reduction in bias — produced no SR change in either the training curve
+or deterministic eval. The gradient correctness is therefore not the lever.
+Combined with the flat tuning matrix and the flat 2-task focus, the bottleneck
+lies elsewhere — most plausibly the update magnitude (only 10 steps at a
+conservative lr) and/or the reward/exploration regime, or limited GRPO headroom
+over this SFT checkpoint. (Caveat: ratio is 0.91 not 1.0, the run was short, and
+n=30 cannot resolve a small gain — but the 0.6→0.91 null makes 0.91→1.0
+unlikely to flip it.)
+
+## Exact gradient: distributed deadlock root cause (now worked around)
 
 The exact unbiased recompute (`recompute_kv_replay=true`) is **correct**: a short
 4-chunk (48-step) distributed run gives `actor/ratio = 1.000`, `ratio_abs = 0`,
